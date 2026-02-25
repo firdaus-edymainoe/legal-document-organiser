@@ -71,6 +71,7 @@ interface PdfFile {
 	pageCount: number;
 	autoFixApplied?: boolean;
 	autoFixSummary?: string;
+	autoFixedPageFixTypes?: Record<number, ("rotation" | "scaling")[]>;
 }
 
 interface TabInfo {
@@ -610,6 +611,53 @@ function PageEditorModal({
 		[file.pageCount, beforePageHeights, afterPageHeights],
 	);
 
+	const pageFixTypes = useMemo(() => {
+		const perPage = new Map<number, { rotation: boolean; scaling: boolean }>();
+		const ensure = (pageIndex: number) => {
+			let existing = perPage.get(pageIndex);
+			if (!existing) {
+				existing = { rotation: false, scaling: false };
+				perPage.set(pageIndex, existing);
+			}
+			return existing;
+		};
+
+		for (const [rawPageIndex, fixTypes] of Object.entries(
+			file.autoFixedPageFixTypes ?? {},
+		)) {
+			const pageIndex = Number(rawPageIndex);
+			if (!Number.isInteger(pageIndex)) continue;
+			const pageFix = ensure(pageIndex);
+			for (const fixType of fixTypes) {
+				if (fixType === "rotation") pageFix.rotation = true;
+				if (fixType === "scaling") pageFix.scaling = true;
+			}
+		}
+
+		if (
+			file.autoFixApplied &&
+			(!file.autoFixedPageFixTypes ||
+				Object.keys(file.autoFixedPageFixTypes).length === 0)
+		) {
+			// Backward compatibility for files loaded before per-page fix-type tracking.
+			for (const pageIndex of availablePageIndices) {
+				const pageFix = ensure(pageIndex);
+				pageFix.rotation = true;
+				pageFix.scaling = true;
+			}
+		}
+
+		for (const modification of modifications) {
+			for (const pageIndex of modification.pageIndices) {
+				const pageFix = ensure(pageIndex);
+				if (modification.type === "rotate") pageFix.rotation = true;
+				if (modification.type === "fitToA4") pageFix.scaling = true;
+			}
+		}
+
+		return perPage;
+	}, [availablePageIndices, file.autoFixApplied, file.autoFixedPageFixTypes, modifications]);
+
 	useEffect(() => {
 		const beforeNode = beforePagePreviewRefs.current[selectedPageIndex];
 		const afterNode = afterPagePreviewRefs.current[selectedPageIndex];
@@ -833,11 +881,31 @@ function PageEditorModal({
 												: "bg-white border-slate-200 text-slate-600 hover:border-indigo-200",
 										)}
 									>
-										<div className="font-medium mb-1">Page {pageIndex + 1}</div>
-										{issue && (
-											<div className="text-xs opacity-80">{issue.description}</div>
-										)}
-									</button>
+											<div className="font-medium mb-1">Page {pageIndex + 1}</div>
+											{pageFixTypes.get(pageIndex) && (
+												<div className="flex items-center gap-1 mb-1">
+													{pageFixTypes.get(pageIndex)?.rotation && (
+														<span
+															className="inline-flex items-center rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-700"
+															title="This page has been rotated to portrait orientation."
+														>
+															Rotation
+														</span>
+													)}
+													{pageFixTypes.get(pageIndex)?.scaling && (
+														<span
+															className="inline-flex items-center rounded-full bg-cyan-100 px-2 py-0.5 text-[11px] font-medium text-cyan-700"
+															title="This page has been scaled to A4 size."
+														>
+															Scaling
+														</span>
+													)}
+												</div>
+											)}
+											{issue && (
+												<div className="text-xs opacity-80">{issue.description}</div>
+											)}
+										</button>
 								);
 							})}
 						</div>
@@ -1227,13 +1295,28 @@ export default function App() {
 		pageCount: number;
 		autoFixApplied: boolean;
 		autoFixSummary?: string;
+		autoFixedPageFixTypes: Record<number, ("rotation" | "scaling")[]>;
 	}> => {
 		try {
 			const srcDoc = await PDFDocument.load(pdfBytes, { updateMetadata: false });
 			const textAngles = await detectDominantTextAngles(pdfBytes);
 			const [A4_WIDTH, A4_HEIGHT] = PageSizes.A4;
 			const pageCount = srcDoc.getPageCount();
-			let changedPages = 0;
+			const autoFixedPageFixes = new Map<
+				number,
+				{ rotation: boolean; scaling: boolean }
+			>();
+			const markFix = (
+				pageIndex: number,
+				type: "rotation" | "scaling",
+			) => {
+				const existing = autoFixedPageFixes.get(pageIndex) ?? {
+					rotation: false,
+					scaling: false,
+				};
+				existing[type] = true;
+				autoFixedPageFixes.set(pageIndex, existing);
+			};
 			let rotatedPages = 0;
 
 			for (let i = 0; i < pageCount; i++) {
@@ -1266,7 +1349,15 @@ export default function App() {
 					Math.abs(width - targetW) > 0.5 ||
 					Math.abs(height - targetH) > 0.5
 				) {
-					changedPages++;
+					if (nextRotation !== currentRotation) {
+						markFix(i, "rotation");
+					}
+					if (
+						Math.abs(width - targetW) > 0.5 ||
+						Math.abs(height - targetH) > 0.5
+					) {
+						markFix(i, "scaling");
+					}
 				}
 			}
 
@@ -1303,23 +1394,33 @@ export default function App() {
 					const page = correctedDoc.getPage(pageIndex);
 					const rotation = normalizeAngle(page.getRotation().angle);
 					page.setRotation(degrees(rotation + 180));
+					markFix(pageIndex, "rotation");
 				}
 				finalBytes = await correctedDoc.save({
 					useObjectStreams: true,
 					objectsPerTick: 100,
 				});
 				rotatedPages += upsideDownPages.length;
-				changedPages += upsideDownPages.length;
 			}
 
 			const finalDocForIssues = await PDFDocument.load(finalBytes, {
 				updateMetadata: false,
 			});
 			const remainingIssues = getIssuesFromDoc(finalDocForIssues);
+			const changedPages = autoFixedPageFixes.size;
 			const autoFixApplied = changedPages > 0;
 			const autoFixSummary = autoFixApplied
 				? `${changedPages}/${pageCount} pages normalized to A4; ${rotatedPages} page(s) auto-rotated using text orientation detection.`
 				: undefined;
+			const autoFixedPageFixTypes = Object.fromEntries(
+				Array.from(autoFixedPageFixes.entries()).map(([pageIndex, fix]) => [
+					pageIndex,
+					[
+						...(fix.rotation ? (["rotation"] as const) : []),
+						...(fix.scaling ? (["scaling"] as const) : []),
+					],
+				]),
+			);
 
 			return {
 				bytes: finalBytes,
@@ -1327,6 +1428,7 @@ export default function App() {
 				pageCount,
 				autoFixApplied,
 				autoFixSummary,
+				autoFixedPageFixTypes,
 			};
 		} catch (error) {
 			console.error("Error auto-fixing PDF:", error);
@@ -1337,6 +1439,7 @@ export default function App() {
 				issues: getIssuesFromDoc(srcDocFallback),
 				pageCount: srcDocFallback.getPageCount(),
 				autoFixApplied: false,
+				autoFixedPageFixTypes: {},
 			};
 		}
 	};
@@ -1345,7 +1448,14 @@ export default function App() {
 		if (file.type === "application/pdf") {
 			const arrayBuffer = await file.arrayBuffer();
 			const originalBytes = new Uint8Array(arrayBuffer);
-			const { bytes: finalBytes, issues, pageCount, autoFixApplied, autoFixSummary } =
+			const {
+				bytes: finalBytes,
+				issues,
+				pageCount,
+				autoFixApplied,
+				autoFixSummary,
+				autoFixedPageFixTypes,
+			} =
 				await autoFixPdf(originalBytes);
 			const id = crypto.randomUUID();
 
@@ -1364,6 +1474,7 @@ export default function App() {
 				issues: issues.length > 0 ? issues : undefined,
 				autoFixApplied,
 				autoFixSummary,
+				autoFixedPageFixTypes,
 			});
 		}
 	};
@@ -1403,7 +1514,14 @@ export default function App() {
 			pdfFiles.map(async (file) => {
 				const arrayBuffer = await file.arrayBuffer();
 				const originalBytes = new Uint8Array(arrayBuffer);
-				const { bytes: finalBytes, issues, pageCount, autoFixApplied, autoFixSummary } =
+				const {
+					bytes: finalBytes,
+					issues,
+					pageCount,
+					autoFixApplied,
+					autoFixSummary,
+					autoFixedPageFixTypes,
+				} =
 					await autoFixPdf(originalBytes);
 				const id = crypto.randomUUID();
 
@@ -1417,6 +1535,7 @@ export default function App() {
 					issues: issues.length > 0 ? issues : undefined,
 					autoFixApplied,
 					autoFixSummary,
+					autoFixedPageFixTypes,
 				};
 			}),
 		);

@@ -1,5 +1,14 @@
-import React, { useState, useCallback, useRef, useEffect } from "react";
-import { PDFDocument, rgb, StandardFonts, PageSizes } from "pdf-lib";
+import React, { useState, useCallback, useRef, useEffect, useMemo } from "react";
+import {
+	PDFDocument,
+	rgb,
+	StandardFonts,
+	PageSizes,
+	degrees,
+	PDFName,
+	PDFArray,
+	PDFNumber,
+} from "pdf-lib";
 import fontkit from '@pdf-lib/fontkit';
 import { CarlitoBase64 } from './CarlitoFont';
 import {
@@ -19,7 +28,6 @@ import {
 	RotateCw,
 	RotateCcw,
 	Maximize,
-	RefreshCw,
 	Layers,
 } from "lucide-react";
 import { Document, Page, pdfjs } from "react-pdf";
@@ -30,7 +38,6 @@ import {
 	DndContext,
 	closestCenter,
 	KeyboardSensor,
-	PointerSensor,
 	MouseSensor,
 	TouchSensor,
 	useSensor,
@@ -61,7 +68,9 @@ interface PdfFile {
 	name: string;
 	file: File;
 	issues?: PageIssue[];
-	autoFixedSizes?: boolean;
+	pageCount: number;
+	autoFixApplied?: boolean;
+	autoFixSummary?: string;
 }
 
 interface TabInfo {
@@ -74,6 +83,187 @@ type PageModification =
 	| { type: "rotate"; pageIndices: number[]; angle: number }
 	| { type: "fitToA4"; pageIndices: number[] };
 
+const RIGHT_ANGLES = [0, 90, 180, 270] as const;
+const TEXT_ORIENTATION_TOLERANCE_DEG = 20;
+
+function normalizeAngle(angle: number): number {
+	const normalized = angle % 360;
+	return normalized < 0 ? normalized + 360 : normalized;
+}
+
+function circularDistance(a: number, b: number): number {
+	const diff = Math.abs(normalizeAngle(a) - normalizeAngle(b));
+	return Math.min(diff, 360 - diff);
+}
+
+function snapToRightAngle(angle: number): number {
+	let best = 0;
+	let bestDistance = Number.POSITIVE_INFINITY;
+	for (const candidate of RIGHT_ANGLES) {
+		const distance = circularDistance(angle, candidate);
+		if (distance < bestDistance) {
+			bestDistance = distance;
+			best = candidate;
+		}
+	}
+	return best;
+}
+
+function chooseFinalPageRotationForPortrait(
+	currentPageRotation: number,
+	dominantTextAngle: number | null,
+): number {
+	if (dominantTextAngle === null) {
+		return 0;
+	}
+
+	const candidates = [0, 180].map((finalRotation) => {
+		const delta = normalizeAngle(finalRotation - currentPageRotation);
+		// pdf.js text item transforms are in page content space and don't include page /Rotate.
+		// So final visible orientation is content angle + final page rotation.
+		const finalTextAngle = normalizeAngle(dominantTextAngle + finalRotation);
+		const bestAllowedDistance = Math.min(
+			circularDistance(finalTextAngle, 0),
+			circularDistance(finalTextAngle, 90),
+		);
+		const turnCost = Math.min(delta, 360 - delta);
+		return { finalRotation, bestAllowedDistance, turnCost };
+	});
+
+	candidates.sort((a, b) => {
+		if (a.bestAllowedDistance !== b.bestAllowedDistance) {
+			return a.bestAllowedDistance - b.bestAllowedDistance;
+		}
+		return a.turnCost - b.turnCost;
+	});
+
+	return candidates[0].finalRotation;
+}
+
+function getUpsideDownCorrectionFromAngle(
+	dominantTextAngle: number | null,
+	pageRotation: number,
+): number {
+	if (dominantTextAngle === null) return 0;
+
+	const visibleTextAngle = normalizeAngle(dominantTextAngle + pageRotation);
+	const allowedDistance = Math.min(
+		circularDistance(visibleTextAngle, 0),
+		circularDistance(visibleTextAngle, 90),
+	);
+	const upsideDistance = Math.min(
+		circularDistance(visibleTextAngle, 180),
+		circularDistance(visibleTextAngle, 270),
+	);
+
+	if (
+		upsideDistance <= TEXT_ORIENTATION_TOLERANCE_DEG &&
+		upsideDistance < allowedDistance
+	) {
+		return 180;
+	}
+	return 0;
+}
+
+async function detectDominantTextAngles(pdfBytes: Uint8Array): Promise<(number | null)[]> {
+	// pdf.js may transfer/detach the provided buffer when parsing in worker mode.
+	// Clone first so callers can continue using the original bytes safely.
+	const bytesForPdfJs = new Uint8Array(pdfBytes);
+	const loadingTask = pdfjs.getDocument({ data: bytesForPdfJs });
+	const pdf = await loadingTask.promise;
+
+	try {
+		const dominantAngles: (number | null)[] = [];
+
+		for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+			const page = await pdf.getPage(pageNumber);
+			const textContent = await page.getTextContent();
+			const bins = new Map<number, number>(RIGHT_ANGLES.map((angle) => [angle, 0]));
+
+			for (const item of textContent.items as any[]) {
+				const text = typeof item?.str === "string" ? item.str.trim() : "";
+				if (!text) continue;
+				if (!Array.isArray(item?.transform) || item.transform.length < 2) {
+					continue;
+				}
+
+				const angle = normalizeAngle(
+					(Math.atan2(item.transform[1], item.transform[0]) * 180) /
+					Math.PI,
+				);
+				const snapped = snapToRightAngle(angle);
+				if (circularDistance(angle, snapped) > TEXT_ORIENTATION_TOLERANCE_DEG) {
+					continue;
+				}
+
+				const weight = Math.max(1, text.length);
+				bins.set(snapped, (bins.get(snapped) ?? 0) + weight);
+			}
+
+			let bestAngle: number | null = null;
+			let bestScore = 0;
+			for (const angle of RIGHT_ANGLES) {
+				const score = bins.get(angle) ?? 0;
+				if (score > bestScore) {
+					bestScore = score;
+					bestAngle = angle;
+				}
+			}
+			dominantAngles.push(bestScore > 0 ? bestAngle : null);
+		}
+
+		return dominantAngles;
+	} finally {
+		await loadingTask.destroy();
+	}
+}
+
+function scaleAndTranslateAnnotationArray(
+	array: PDFArray,
+	scale: number,
+	dx: number,
+	dy: number,
+) {
+	for (let i = 0; i + 1 < array.size(); i += 2) {
+		const xObj = array.get(i);
+		const yObj = array.get(i + 1);
+		if (!(xObj instanceof PDFNumber) || !(yObj instanceof PDFNumber)) continue;
+		array.set(i, PDFNumber.of(xObj.asNumber() * scale + dx));
+		array.set(i + 1, PDFNumber.of(yObj.asNumber() * scale + dy));
+	}
+}
+
+function scaleAndTranslatePageAnnotations(
+	page: ReturnType<PDFDocument["getPage"]>,
+	scale: number,
+	dx: number,
+	dy: number,
+) {
+	const annots = page.node.lookupMaybe(PDFName.of("Annots"), PDFArray);
+	if (!annots) return;
+
+	for (let i = 0; i < annots.size(); i++) {
+		const annotRef = annots.get(i);
+		const annotDict = page.doc.context.lookup(annotRef);
+		if (!annotDict || typeof (annotDict as any).lookupMaybe !== "function") {
+			continue;
+		}
+
+		const rect = (annotDict as any).lookupMaybe(PDFName.of("Rect"), PDFArray);
+		if (rect instanceof PDFArray) {
+			scaleAndTranslateAnnotationArray(rect, scale, dx, dy);
+		}
+
+		const quadPoints = (annotDict as any).lookupMaybe(
+			PDFName.of("QuadPoints"),
+			PDFArray,
+		);
+		if (quadPoints instanceof PDFArray) {
+			scaleAndTranslateAnnotationArray(quadPoints, scale, dx, dy);
+		}
+	}
+}
+
 function getIssuesFromDoc(doc: PDFDocument): PageIssue[] {
 	const pages = doc.getPages();
 	const [A4_WIDTH, A4_HEIGHT] = PageSizes.A4;
@@ -83,30 +273,33 @@ function getIssuesFromDoc(doc: PDFDocument): PageIssue[] {
 		const { width, height } = page.getSize();
 		const rotation = page.getRotation();
 
-		const effectiveWidth = rotation.angle % 180 === 0 ? width : height;
-		const effectiveHeight = rotation.angle % 180 === 0 ? height : width;
-
-		const isPortrait = effectiveHeight >= effectiveWidth;
-
+		const isPortrait = height >= width;
+		const isPortraitRotation = rotation.angle % 180 === 0;
 		const isA4Dimensions =
-			(Math.abs(width - A4_WIDTH) <= 5 &&
-				Math.abs(height - A4_HEIGHT) <= 5) ||
-			(Math.abs(width - A4_HEIGHT) <= 5 &&
-				Math.abs(height - A4_WIDTH) <= 5);
+			Math.abs(width - A4_WIDTH) <= 5 && Math.abs(height - A4_HEIGHT) <= 5;
 
-		if (!isPortrait || !isA4Dimensions) {
+		if (!isPortrait || !isA4Dimensions || !isPortraitRotation) {
 			let type: "size" | "orientation" | "both" = "size";
 			const parts = [];
 
 			if (!isPortrait) {
-				parts.push("Landscape");
+				parts.push("Landscape Page Box");
 				type = "orientation";
 			}
 			if (!isA4Dimensions) {
 				parts.push("Non-A4 Size");
 				type = "size";
 			}
-			if (!isPortrait && !isA4Dimensions) type = "both";
+			if (!isPortraitRotation) {
+				parts.push("Sideways Page Rotation");
+				type = "orientation";
+			}
+			if (
+				(!isPortrait || !isPortraitRotation) &&
+				!isA4Dimensions
+			) {
+				type = "both";
+			}
 
 			issues.push({
 				pageIndex: index,
@@ -119,11 +312,58 @@ function getIssuesFromDoc(doc: PDFDocument): PageIssue[] {
 	return issues;
 }
 
+async function getScaledPageHeightsForRender(
+	pdfBytes: Uint8Array,
+	targetWidth: number,
+): Promise<number[]> {
+	const doc = await PDFDocument.load(pdfBytes, { updateMetadata: false });
+	return doc.getPages().map((page) => {
+		const { width, height } = page.getSize();
+		const rotation = normalizeAngle(page.getRotation().angle);
+		const effectiveWidth = rotation % 180 === 0 ? width : height;
+		const effectiveHeight = rotation % 180 === 0 ? height : width;
+		return (targetWidth * effectiveHeight) / effectiveWidth;
+	});
+}
+
+function getBeforePreviewDisplayRotation(
+	width: number,
+	height: number,
+	pageRotation: number,
+	dominantTextAngle: number | null,
+): number {
+	if (dominantTextAngle === null) return 0;
+
+	const effectiveWidth = pageRotation % 180 === 0 ? width : height;
+	const effectiveHeight = pageRotation % 180 === 0 ? height : width;
+	const isPortraitPage = effectiveHeight >= effectiveWidth;
+	if (!isPortraitPage) return 0;
+
+	const visibleTextAngle = normalizeAngle(dominantTextAngle + pageRotation);
+	if (visibleTextAngle === 90) return 270;
+	if (visibleTextAngle === 270) return 90;
+	return 0;
+}
+
+function getRenderedHeightAtWidth(
+	width: number,
+	height: number,
+	pageRotation: number,
+	targetWidth: number,
+	additionalRotation: number,
+): number {
+	const totalRotation = normalizeAngle(pageRotation + additionalRotation);
+	const effectiveWidth = totalRotation % 180 === 0 ? width : height;
+	const effectiveHeight = totalRotation % 180 === 0 ? height : width;
+	return (targetWidth * effectiveHeight) / effectiveWidth;
+}
+
 const PREVIEW_DEBOUNCE_MS = 120;
 
 interface PageEditorModalProps {
 	file: PdfFile;
 	fileBytes: Uint8Array;
+	originalFileBytes: Uint8Array;
 	onClose: () => void;
 	onSave: (file: PdfFile, newBytes: Uint8Array) => void;
 }
@@ -131,25 +371,110 @@ interface PageEditorModalProps {
 function PageEditorModal({
 	file,
 	fileBytes,
+	originalFileBytes,
 	onClose,
 	onSave,
 }: PageEditorModalProps) {
-	const [selectedPageIndex, setSelectedPageIndex] = useState<number>(
-		file.issues?.[0]?.pageIndex ?? 0,
+	type CompareView = "before" | "after" | "split";
+
+	const availablePageIndices = Array.from(
+		{ length: file.pageCount },
+		(_, i) => i,
 	);
+
+	const [selectedPageIndex, setSelectedPageIndex] = useState<number>(
+		availablePageIndices[0] ?? 0,
+	);
+	const [beforePreviewUrl, setBeforePreviewUrl] = useState<string | null>(null);
 	const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+	const [afterPreviewBytes, setAfterPreviewBytes] = useState<Uint8Array | null>(
+		null,
+	);
+	const [compareView, setCompareView] = useState<CompareView>("after");
 	const [isSaving, setIsSaving] = useState(false);
 	const [isPreviewLoading, setIsPreviewLoading] = useState(true);
 	const [applyToAll, setApplyToAll] = useState(false);
 	const [modifications, setModifications] = useState<PageModification[]>([]);
+	const [beforePageHeights, setBeforePageHeights] = useState<number[]>([]);
+	const [afterPageHeights, setAfterPageHeights] = useState<number[]>([]);
+	const [beforeDisplayRotations, setBeforeDisplayRotations] = useState<number[]>(
+		[],
+	);
+	const splitPageRenderWidth = 420;
+	const pageRenderWidth = compareView === "split" ? splitPageRenderWidth : 560;
+	const renderedPageWidth =
+		compareView === "split"
+			? pageRenderWidth
+			: Math.min(window.innerWidth * 0.3, pageRenderWidth);
 
 	const workerRef = useRef<Worker | null>(null);
 	const previewRequestIdRef = useRef(0);
 	const previewTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const previewUrlRef = useRef<string | null>(null);
+	const beforePagePreviewRefs = useRef<Array<HTMLDivElement | null>>([]);
+	const afterPagePreviewRefs = useRef<Array<HTMLDivElement | null>>([]);
 
 	// Keep ref in sync for cleanup
 	previewUrlRef.current = previewUrl;
+
+	useEffect(() => {
+		const url = URL.createObjectURL(
+			new Blob([originalFileBytes], { type: "application/pdf" }),
+		);
+		setBeforePreviewUrl(url);
+		return () => URL.revokeObjectURL(url);
+	}, [originalFileBytes]);
+
+	useEffect(() => {
+		let cancelled = false;
+
+		void (async () => {
+			const textAngles = await detectDominantTextAngles(originalFileBytes);
+			const doc = await PDFDocument.load(originalFileBytes, {
+				updateMetadata: false,
+			});
+			const pages = doc.getPages();
+			const rotations = pages.map((page, index) => {
+				const { width, height } = page.getSize();
+				const pageRotation = normalizeAngle(page.getRotation().angle);
+				const additionalRotation = getBeforePreviewDisplayRotation(
+					width,
+					height,
+					pageRotation,
+					textAngles[index] ?? null,
+				);
+				return normalizeAngle(pageRotation + additionalRotation);
+			});
+			const heights = pages.map((page, index) => {
+				const { width, height } = page.getSize();
+				const pageRotation = normalizeAngle(page.getRotation().angle);
+				return getRenderedHeightAtWidth(
+					width,
+					height,
+					pageRotation,
+					splitPageRenderWidth,
+					normalizeAngle((rotations[index] ?? pageRotation) - pageRotation),
+				);
+			});
+			return { rotations, heights };
+		})()
+			.then(({ rotations, heights }) => {
+				if (!cancelled) {
+					setBeforeDisplayRotations(rotations);
+					setBeforePageHeights(heights);
+				}
+			})
+			.catch(() => {
+				if (!cancelled) {
+					setBeforeDisplayRotations([]);
+					setBeforePageHeights([]);
+				}
+			});
+
+		return () => {
+			cancelled = true;
+		};
+	}, [originalFileBytes]);
 
 	// Single persistent worker - all heavy work runs off main thread
 	useEffect(() => {
@@ -179,7 +504,7 @@ function PageEditorModal({
 				type: "preview",
 				useCachedBytes: true,
 				modifications,
-				pageIndex: selectedPageIndex,
+				fullDocumentPreview: true,
 				requestId,
 			});
 		} else {
@@ -190,15 +515,15 @@ function PageEditorModal({
 					type: "preview",
 					bytes: bytesCopy,
 					modifications,
-					pageIndex: selectedPageIndex,
+					fullDocumentPreview: true,
 					requestId,
 				},
 				[bytesCopy.buffer],
 			);
 		}
-	}, [fileBytes, modifications, selectedPageIndex]);
+	}, [fileBytes, modifications]);
 
-	// Debounced preview: when page or modifications change, request after delay
+	// Debounced preview: when modifications change, request after delay
 	useEffect(() => {
 		if (previewTimeoutRef.current) clearTimeout(previewTimeoutRef.current);
 
@@ -213,7 +538,7 @@ function PageEditorModal({
 				clearTimeout(previewTimeoutRef.current);
 			}
 		};
-	}, [selectedPageIndex, modifications, requestPreview]);
+	}, [modifications, requestPreview]);
 
 	// Handle worker responses
 	useEffect(() => {
@@ -228,8 +553,13 @@ function PageEditorModal({
 			}
 			if (type === "preview") {
 				if (requestId !== previewRequestIdRef.current) return; // stale
+				const previewBytes =
+					e.data.bytes instanceof Uint8Array
+						? e.data.bytes
+						: new Uint8Array(e.data.bytes);
+				setAfterPreviewBytes(previewBytes);
 				const url = URL.createObjectURL(
-					new Blob([e.data.bytes], { type: "application/pdf" }),
+					new Blob([previewBytes], { type: "application/pdf" }),
 				);
 				setPreviewUrl((prev) => {
 					if (prev) URL.revokeObjectURL(prev);
@@ -243,28 +573,76 @@ function PageEditorModal({
 		return () => worker.removeEventListener("message", handleMessage);
 	}, []);
 
+	useEffect(() => {
+		if (!afterPreviewBytes) {
+			setAfterPageHeights([]);
+			return;
+		}
+
+		let cancelled = false;
+
+		void getScaledPageHeightsForRender(afterPreviewBytes, splitPageRenderWidth)
+			.then((heights) => {
+				if (!cancelled) {
+					setAfterPageHeights(heights);
+				}
+			})
+			.catch(() => {
+				if (!cancelled) {
+					setAfterPageHeights([]);
+				}
+			});
+
+		return () => {
+			cancelled = true;
+		};
+	}, [afterPreviewBytes]);
+
+	const splitRowHeights = useMemo(
+		() =>
+			Array.from({ length: file.pageCount }, (_, index) =>
+				Math.max(
+					beforePageHeights[index] ?? 0,
+					afterPageHeights[index] ?? 0,
+					160,
+				),
+			),
+		[file.pageCount, beforePageHeights, afterPageHeights],
+	);
+
+	useEffect(() => {
+		const beforeNode = beforePagePreviewRefs.current[selectedPageIndex];
+		const afterNode = afterPagePreviewRefs.current[selectedPageIndex];
+		if (compareView !== "after" && beforeNode) {
+			beforeNode.scrollIntoView({ block: "center", behavior: "smooth" });
+		}
+		if (compareView !== "before" && afterNode) {
+			afterNode.scrollIntoView({ block: "center", behavior: "smooth" });
+		}
+	}, [compareView, selectedPageIndex, beforePreviewUrl, previewUrl]);
+
 	const handleRotate = useCallback(
 		(angle: number) => {
 			const pageIndices = applyToAll
-				? (file.issues?.map((issue) => issue.pageIndex) || [])
+				? availablePageIndices
 				: [selectedPageIndex];
 			setModifications((prev) => [
 				...prev,
 				{ type: "rotate", pageIndices, angle },
 			]);
 		},
-		[applyToAll, file.issues, selectedPageIndex],
+		[applyToAll, availablePageIndices, selectedPageIndex],
 	);
 
 	const handleFitToA4 = useCallback(() => {
 		const indicesToProcess = applyToAll
-			? (file.issues?.map((issue) => issue.pageIndex) || [])
+			? availablePageIndices
 			: [selectedPageIndex];
 		setModifications((prev) => [
 			...prev,
 			{ type: "fitToA4", pageIndices: indicesToProcess },
 		]);
-	}, [applyToAll, file.issues, selectedPageIndex]);
+	}, [applyToAll, availablePageIndices, selectedPageIndex]);
 
 	const handleSave = useCallback(async () => {
 		setIsSaving(true);
@@ -334,12 +712,53 @@ function PageEditorModal({
 					<h3 className="font-semibold text-slate-700 flex items-center gap-2 min-w-0">
 						<AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0" />
 						<span className="truncate">
-							Fix Issues: {file.name}
+							Review & Amend: {file.name}
 						</span>
 					</h3>
 
 					{/* Toolbar in Header */}
 					<div className="flex items-center gap-2 mx-4">
+						<div className="inline-flex items-center rounded-lg border border-slate-200 bg-white p-1 shadow-sm">
+							<button
+								type="button"
+								onClick={() => setCompareView("before")}
+								className={cn(
+									"px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors",
+									compareView === "before"
+										? "bg-indigo-600 text-white"
+										: "text-slate-600 hover:bg-slate-100",
+								)}
+							>
+								Before
+							</button>
+							<button
+								type="button"
+								onClick={() => setCompareView("after")}
+								className={cn(
+									"px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors",
+									compareView === "after"
+										? "bg-indigo-600 text-white"
+										: "text-slate-600 hover:bg-slate-100",
+								)}
+							>
+								After
+							</button>
+							<button
+								type="button"
+								onClick={() => setCompareView("split")}
+								className={cn(
+									"px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors",
+									compareView === "split"
+										? "bg-indigo-600 text-white"
+										: "text-slate-600 hover:bg-slate-100",
+								)}
+							>
+								Split
+							</button>
+						</div>
+
+						<div className="w-px h-6 bg-slate-200 mx-1" />
+
 						<button
 							onClick={() => setApplyToAll(!applyToAll)}
 							className={cn(
@@ -396,70 +815,168 @@ function PageEditorModal({
 					{/* Sidebar with issues */}
 					<div className="w-64 bg-slate-50 border-r border-slate-200 overflow-y-auto p-4 flex-shrink-0">
 						<h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">
-							Pages with Issues
+							Pages
 						</h4>
 						<div className="space-y-2">
-							{file.issues?.map((issue) => (
-								<button
-									key={issue.pageIndex}
-									onClick={() =>
-										setSelectedPageIndex(issue.pageIndex)
-									}
-									className={cn(
-										"w-full text-left p-3 rounded-lg text-sm transition-colors border",
-										selectedPageIndex === issue.pageIndex
-											? "bg-indigo-50 border-indigo-200 text-indigo-700"
-											: "bg-white border-slate-200 text-slate-600 hover:border-indigo-200",
-									)}
-								>
-									<div className="font-medium mb-1">
-										Page {issue.pageIndex + 1}
-									</div>
-									<div className="text-xs opacity-80">
-										{issue.description}
-									</div>
-								</button>
-							))}
-							{(!file.issues || file.issues.length === 0) && (
-								<div className="text-sm text-slate-500 italic">
-									No issues detected.
-								</div>
-							)}
+							{availablePageIndices.map((pageIndex) => {
+								const issue = file.issues?.find(
+									(item) => item.pageIndex === pageIndex,
+								);
+								return (
+									<button
+										key={pageIndex}
+										onClick={() => setSelectedPageIndex(pageIndex)}
+										className={cn(
+											"w-full text-left p-3 rounded-lg text-sm transition-colors border",
+											selectedPageIndex === pageIndex
+												? "bg-indigo-50 border-indigo-200 text-indigo-700"
+												: "bg-white border-slate-200 text-slate-600 hover:border-indigo-200",
+										)}
+									>
+										<div className="font-medium mb-1">Page {pageIndex + 1}</div>
+										{issue && (
+											<div className="text-xs opacity-80">{issue.description}</div>
+										)}
+									</button>
+								);
+							})}
 						</div>
 					</div>
 
 					{/* Main Preview Area */}
-					<div className="flex-1 bg-slate-100 p-8 flex flex-col items-center overflow-y-auto">
-						<div className="bg-white shadow-lg min-w-[500px] min-h-[400px] flex items-center justify-center">
-							{isPreviewLoading || !previewUrl ? (
+					<div className="flex-1 bg-slate-100 overflow-auto p-6">
+						{isPreviewLoading || !previewUrl || !beforePreviewUrl ? (
+							<div className="h-full flex items-center justify-center">
 								<Loader2 className="w-8 h-8 animate-spin text-indigo-500" />
-							) : (
-								<Document
-									key={previewUrl}
-									file={previewUrl}
-									loading={
-										<Loader2 className="w-8 h-8 animate-spin text-indigo-500 m-12" />
-									}
-									error={
-										<div className="flex flex-col items-center justify-center h-64 text-red-500 p-4 text-center">
-											<AlertTriangle className="w-8 h-8 mb-2" />
-											<p>Failed to load preview.</p>
-											<p className="text-xs mt-1">
-												Try refreshing or selecting
-												another page.
-											</p>
-										</div>
-									}
-								>
-									<Page
-										pageNumber={1}
-										width={500}
-										renderTextLayer={false}
-										renderAnnotationLayer={false}
-									/>
-								</Document>
-							)}
-						</div>
+							</div>
+						) : (
+							<div
+								className={cn(
+									"gap-6 items-start",
+									compareView === "split"
+										? "grid grid-cols-2 min-w-[904px]"
+										: "grid grid-cols-1",
+								)}
+								style={
+									compareView === "split"
+										? { gridTemplateColumns: "minmax(440px, 1fr) minmax(440px, 1fr)" }
+										: undefined
+								}
+							>
+								<div className={cn("min-w-0", compareView === "after" ? "hidden" : "block")}>
+									<h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">
+										Before Auto-Fix
+									</h4>
+									<Document
+										key={beforePreviewUrl}
+										file={beforePreviewUrl}
+										className="flex flex-col items-center gap-6 py-2"
+										loading={
+											<Loader2 className="w-8 h-8 animate-spin text-indigo-500 m-12" />
+										}
+										error={
+											<div className="flex flex-col items-center justify-center h-64 text-red-500 p-4 text-center">
+												<AlertTriangle className="w-8 h-8 mb-2" />
+												<p>Failed to load original preview.</p>
+											</div>
+										}
+									>
+										{Array.from(
+											new Array(file.pageCount),
+											(_el, index) => (
+												<div
+													key={`before_editor_page_${index + 1}`}
+													ref={(el) => {
+														beforePagePreviewRefs.current[index] = el;
+													}}
+													onClick={() => setSelectedPageIndex(index)}
+													className={cn(
+														"relative shadow-lg border-2 cursor-pointer transition-colors",
+														selectedPageIndex === index
+															? "border-indigo-500"
+															: "border-transparent hover:border-indigo-200",
+														compareView === "split" &&
+														"min-h-[1px] flex items-center justify-center",
+													)}
+													style={
+														compareView === "split"
+															? { minHeight: splitRowHeights[index] }
+															: undefined
+													}
+												>
+													<div className="absolute top-2 right-2 bg-black/55 text-white text-xs px-2 py-1 rounded z-10 pointer-events-none">
+														Page {index + 1}
+													</div>
+													<Page
+														pageNumber={index + 1}
+														renderTextLayer={false}
+														renderAnnotationLayer={false}
+														width={renderedPageWidth}
+														rotate={beforeDisplayRotations[index]}
+													/>
+												</div>
+											),
+										)}
+									</Document>
+								</div>
+
+								<div className={cn("min-w-0", compareView === "before" ? "hidden" : "block")}>
+									<h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">
+										After Changes
+									</h4>
+									<Document
+										key={previewUrl}
+										file={previewUrl}
+										className="flex flex-col items-center gap-6 py-2"
+										loading={
+											<Loader2 className="w-8 h-8 animate-spin text-indigo-500 m-12" />
+										}
+										error={
+											<div className="flex flex-col items-center justify-center h-64 text-red-500 p-4 text-center">
+												<AlertTriangle className="w-8 h-8 mb-2" />
+												<p>Failed to load edited preview.</p>
+											</div>
+										}
+									>
+										{Array.from(
+											new Array(file.pageCount),
+											(_el, index) => (
+												<div
+													key={`after_editor_page_${index + 1}`}
+													ref={(el) => {
+														afterPagePreviewRefs.current[index] = el;
+													}}
+													onClick={() => setSelectedPageIndex(index)}
+													className={cn(
+														"relative shadow-lg bg-white border-2 cursor-pointer transition-colors",
+														selectedPageIndex === index
+															? "border-indigo-500"
+															: "border-transparent hover:border-indigo-200",
+														compareView === "split" &&
+														"min-h-[1px] flex items-center justify-center",
+													)}
+													style={
+														compareView === "split"
+															? { minHeight: splitRowHeights[index] }
+															: undefined
+													}
+												>
+													<div className="absolute top-2 right-2 bg-black/55 text-white text-xs px-2 py-1 rounded z-10 pointer-events-none">
+														Page {index + 1}
+													</div>
+													<Page
+														pageNumber={index + 1}
+														renderTextLayer={false}
+														renderAnnotationLayer={false}
+														width={renderedPageWidth}
+													/>
+												</div>
+											),
+										)}
+									</Document>
+								</div>
+							</div>
+						)}
 					</div>
 				</div>
 
@@ -545,24 +1062,24 @@ function SortableItem({
 								{file.issues.length > 1 ? "s" : ""}
 							</span>
 						)}
-						{file.autoFixedSizes && (
-							<span className="flex items-center gap-1 text-xs font-medium text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200" title="Pages missing A4 size dimensions were automatically scaled to visually fit A4">
+						{file.autoFixApplied && (
+							<span className="flex items-center gap-1 text-xs font-medium text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200" title={file.autoFixSummary || "All pages were auto-fixed to A4 and portrait constraints."}>
 								<Check className="w-3 h-3" />
-								Auto-Scaled to A4
+								Auto-Fixed
 							</span>
 						)}
 					</div>
 				</div>
 			</div>
 
-			{file.issues && file.issues.length > 0 && (
+			{(file.issues && file.issues.length > 0) || file.autoFixApplied ? (
 				<button
 					onClick={() => onEdit(file)}
 					className="px-3 py-1.5 text-xs font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors flex items-center gap-1"
 				>
-					Fix Issues
+					Review & Amend
 				</button>
-			)}
+			) : null}
 
 			<button
 				onClick={() => onPreview(file)}
@@ -669,6 +1186,7 @@ export default function App() {
 	const [coverFile, setCoverFile] = useState<PdfFile | null>(null);
 	const [individualFiles, setIndividualFiles] = useState<PdfFile[]>([]);
 	const bytesStoreRef = useRef<Map<string, Uint8Array>>(new Map());
+	const originalBytesStoreRef = useRef<Map<string, Uint8Array>>(new Map());
 	const [isGenerating, setIsGenerating] = useState(false);
 	const [generatedPdfUrl, setGeneratedPdfUrl] = useState<string | null>(null);
 	const [tabInfo, setTabInfo] = useState<TabInfo[]>([]);
@@ -697,53 +1215,129 @@ export default function App() {
 	);
 
 	const [editingFile, setEditingFile] = useState<PdfFile | null>(null);
+	const [editingOriginalBytes, setEditingOriginalBytes] =
+		useState<Uint8Array | null>(null);
+	const editRequestIdRef = useRef(0);
 
-	const autoFixPdf = async (pdfBytes: Uint8Array): Promise<{ bytes: Uint8Array, issues: PageIssue[], autoFixedSizes: boolean }> => {
+	const autoFixPdf = async (
+		pdfBytes: Uint8Array,
+	): Promise<{
+		bytes: Uint8Array;
+		issues: PageIssue[];
+		pageCount: number;
+		autoFixApplied: boolean;
+		autoFixSummary?: string;
+	}> => {
 		try {
 			const srcDoc = await PDFDocument.load(pdfBytes, { updateMetadata: false });
-			const initialIssues = getIssuesFromDoc(srcDoc);
+			const textAngles = await detectDominantTextAngles(pdfBytes);
+			const [A4_WIDTH, A4_HEIGHT] = PageSizes.A4;
+			const pageCount = srcDoc.getPageCount();
+			let changedPages = 0;
+			let rotatedPages = 0;
 
-			// Only auto-fix pages that have size issues
-			const pagesToFix = initialIssues.filter(i => i.issueType === "size" || i.issueType === "both");
+			for (let i = 0; i < pageCount; i++) {
+				const page = srcDoc.getPage(i);
+				const { width, height } = page.getSize();
+				const currentRotation = normalizeAngle(page.getRotation().angle);
+				const detectedTextAngle = textAngles[i] ?? null;
+				const nextRotation = chooseFinalPageRotationForPortrait(
+					currentRotation,
+					detectedTextAngle,
+				);
+				page.setRotation(degrees(nextRotation));
+				if (nextRotation !== currentRotation) rotatedPages++;
 
-			if (pagesToFix.length > 0) {
-				const [A4_WIDTH, A4_HEIGHT] = PageSizes.A4;
-				const indicesToFix = new Set(pagesToFix.map(i => i.pageIndex));
-				const pageCount = srcDoc.getPageCount();
-				for (let i = 0; i < pageCount; i++) {
-					if (indicesToFix.has(i)) {
-						const page = srcDoc.getPage(i);
-						const { width, height } = page.getSize();
-						const rotation = page.getRotation();
-						const effectiveWidth = rotation.angle % 180 === 0 ? width : height;
-						const effectiveHeight = rotation.angle % 180 === 0 ? height : width;
-						const isPortrait = effectiveHeight >= effectiveWidth;
+				const targetW = A4_WIDTH;
+				const targetH = A4_HEIGHT;
+				const scale = Math.min(targetW / width, targetH / height);
+				const scaledWidth = width * scale;
+				const scaledHeight = height * scale;
+				const dx = (targetW - scaledWidth) / 2;
+				const dy = (targetH - scaledHeight) / 2;
 
-						const targetW = isPortrait ? A4_WIDTH : A4_HEIGHT;
-						const targetH = isPortrait ? A4_HEIGHT : A4_WIDTH;
+				page.setSize(targetW, targetH);
+				page.scaleContent(scale, scale);
+				page.translateContent(dx, dy);
+				scaleAndTranslatePageAnnotations(page, scale, dx, dy);
 
-						const scale = Math.min(targetW / width, targetH / height);
-						const scaledWidth = width * scale;
-						const scaledHeight = height * scale;
-						const dx = (targetW - scaledWidth) / 2;
-						const dy = (targetH - scaledHeight) / 2;
-
-						page.setSize(targetW, targetH);
-						page.translateContent(dx, dy);
-						page.scaleContent(scale, scale);
-					}
+				if (
+					nextRotation !== currentRotation ||
+					Math.abs(width - targetW) > 0.5 ||
+					Math.abs(height - targetH) > 0.5
+				) {
+					changedPages++;
 				}
-				const newBytes = await srcDoc.save({ useObjectStreams: true, objectsPerTick: 100 });
-				// Capture remaining issues (e.g. orientation) after resizing
-				const remainingIssues = getIssuesFromDoc(srcDoc);
-				return { bytes: newBytes, issues: remainingIssues, autoFixedSizes: true };
 			}
-			return { bytes: pdfBytes, issues: initialIssues, autoFixedSizes: false };
+
+			const firstPassBytes = await srcDoc.save({
+				useObjectStreams: true,
+				objectsPerTick: 100,
+			});
+
+			const finalAngles = await detectDominantTextAngles(firstPassBytes);
+			const firstPassDoc = await PDFDocument.load(firstPassBytes, {
+				updateMetadata: false,
+			});
+			const firstPassRotations = firstPassDoc
+				.getPages()
+				.map((page) => normalizeAngle(page.getRotation().angle));
+			const upsideDownPages: number[] = [];
+			for (let i = 0; i < finalAngles.length; i++) {
+				if (
+					getUpsideDownCorrectionFromAngle(
+						finalAngles[i],
+						firstPassRotations[i] ?? 0,
+					) === 180
+				) {
+					upsideDownPages.push(i);
+				}
+			}
+
+			let finalBytes = firstPassBytes;
+			if (upsideDownPages.length > 0) {
+				const correctedDoc = await PDFDocument.load(firstPassBytes, {
+					updateMetadata: false,
+				});
+				for (const pageIndex of upsideDownPages) {
+					const page = correctedDoc.getPage(pageIndex);
+					const rotation = normalizeAngle(page.getRotation().angle);
+					page.setRotation(degrees(rotation + 180));
+				}
+				finalBytes = await correctedDoc.save({
+					useObjectStreams: true,
+					objectsPerTick: 100,
+				});
+				rotatedPages += upsideDownPages.length;
+				changedPages += upsideDownPages.length;
+			}
+
+			const finalDocForIssues = await PDFDocument.load(finalBytes, {
+				updateMetadata: false,
+			});
+			const remainingIssues = getIssuesFromDoc(finalDocForIssues);
+			const autoFixApplied = changedPages > 0;
+			const autoFixSummary = autoFixApplied
+				? `${changedPages}/${pageCount} pages normalized to A4; ${rotatedPages} page(s) auto-rotated using text orientation detection.`
+				: undefined;
+
+			return {
+				bytes: finalBytes,
+				issues: remainingIssues,
+				pageCount,
+				autoFixApplied,
+				autoFixSummary,
+			};
 		} catch (error) {
 			console.error("Error auto-fixing PDF:", error);
 			// Fallback: return original bytes and issues if it fails
 			const srcDocFallback = await PDFDocument.load(pdfBytes, { updateMetadata: false });
-			return { bytes: pdfBytes, issues: getIssuesFromDoc(srcDocFallback), autoFixedSizes: false };
+			return {
+				bytes: pdfBytes,
+				issues: getIssuesFromDoc(srcDocFallback),
+				pageCount: srcDocFallback.getPageCount(),
+				autoFixApplied: false,
+			};
 		}
 	};
 
@@ -751,16 +1345,25 @@ export default function App() {
 		if (file.type === "application/pdf") {
 			const arrayBuffer = await file.arrayBuffer();
 			const originalBytes = new Uint8Array(arrayBuffer);
-			const { bytes: finalBytes, issues, autoFixedSizes } = await autoFixPdf(originalBytes);
+			const { bytes: finalBytes, issues, pageCount, autoFixApplied, autoFixSummary } =
+				await autoFixPdf(originalBytes);
 			const id = crypto.randomUUID();
 
+			if (coverFile) {
+				bytesStoreRef.current.delete(coverFile.id);
+				originalBytesStoreRef.current.delete(coverFile.id);
+			}
+
 			bytesStoreRef.current.set(id, finalBytes);
+			originalBytesStoreRef.current.set(id, originalBytes);
 			setCoverFile({
 				id,
 				name: file.name,
 				file,
+				pageCount,
 				issues: issues.length > 0 ? issues : undefined,
-				autoFixedSizes,
+				autoFixApplied,
+				autoFixSummary,
 			});
 		}
 	};
@@ -800,16 +1403,20 @@ export default function App() {
 			pdfFiles.map(async (file) => {
 				const arrayBuffer = await file.arrayBuffer();
 				const originalBytes = new Uint8Array(arrayBuffer);
-				const { bytes: finalBytes, issues, autoFixedSizes } = await autoFixPdf(originalBytes);
+				const { bytes: finalBytes, issues, pageCount, autoFixApplied, autoFixSummary } =
+					await autoFixPdf(originalBytes);
 				const id = crypto.randomUUID();
 
 				bytesStoreRef.current.set(id, finalBytes);
+				originalBytesStoreRef.current.set(id, originalBytes);
 				return {
 					id,
 					name: file.name,
 					file,
+					pageCount,
 					issues: issues.length > 0 ? issues : undefined,
-					autoFixedSizes,
+					autoFixApplied,
+					autoFixSummary,
 				};
 			}),
 		);
@@ -868,6 +1475,28 @@ export default function App() {
 
 	const handleEdit = (file: PdfFile) => {
 		setEditingFile(file);
+		setEditingOriginalBytes(null);
+		const requestId = ++editRequestIdRef.current;
+
+		const existingOriginalBytes = originalBytesStoreRef.current.get(file.id);
+		if (existingOriginalBytes) {
+			setEditingOriginalBytes(existingOriginalBytes);
+			return;
+		}
+
+		void (async () => {
+			try {
+				const originalBytes = new Uint8Array(await file.file.arrayBuffer());
+				originalBytesStoreRef.current.set(file.id, originalBytes);
+				if (requestId !== editRequestIdRef.current) return;
+				setEditingOriginalBytes(originalBytes);
+			} catch (error) {
+				console.error("Failed to load original bytes for edit preview:", error);
+				const fallbackBytes = bytesStoreRef.current.get(file.id) ?? null;
+				if (requestId !== editRequestIdRef.current) return;
+				setEditingOriginalBytes(fallbackBytes);
+			}
+		})();
 	};
 
 	const handleSaveEdit = (updatedFile: PdfFile, newBytes: Uint8Array) => {
@@ -887,6 +1516,7 @@ export default function App() {
 			);
 		}
 		setEditingFile(null);
+		setEditingOriginalBytes(null);
 	};
 
 	const copyPageNumbers = () => {
@@ -898,6 +1528,7 @@ export default function App() {
 
 	const removeIndividualFile = (id: string) => {
 		bytesStoreRef.current.delete(id);
+		originalBytesStoreRef.current.delete(id);
 		setIndividualFiles((prev) => prev.filter((f) => f.id !== id));
 	};
 
@@ -1040,7 +1671,7 @@ export default function App() {
 						</div>
 						<p className="text-slate-500 text-sm mb-6">
 							Upload your combined cover page and index document.
-							This will be placed at the very beginning.
+							This will be placed at the very beginning. Pages are auto-fixed to A4 and portrait on upload.
 						</p>
 
 						<label
@@ -1081,30 +1712,33 @@ export default function App() {
 																: ""}
 														</span>
 													)}
-												{coverFile.autoFixedSizes && (
-													<span className="flex items-center gap-1 text-xs font-medium text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200" title="Pages missing A4 size dimensions were automatically scaled to visually fit A4">
+												{coverFile.autoFixApplied && (
+													<span className="flex items-center gap-1 text-xs font-medium text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200" title={coverFile.autoFixSummary || "All pages were auto-fixed to A4 and portrait constraints."}>
 														<Check className="w-3 h-3" />
-														Auto-Scaled to A4
+														Auto-Fixed
 													</span>
 												)}
 											</div>
 
-											{coverFile.issues &&
-												coverFile.issues.length > 0 && (
-													<button
-														type="button"
-														onClick={(e) => {
-															e.preventDefault();
-															e.stopPropagation();
-															handleEdit(
-																coverFile,
-															);
-														}}
-														className="px-3 py-1.5 text-xs font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors flex items-center gap-1"
-													>
-														Fix Issues
-													</button>
-												)}
+											<div className="flex items-center gap-2">
+												{((coverFile.issues &&
+													coverFile.issues.length > 0) ||
+													coverFile.autoFixApplied) && (
+														<button
+															type="button"
+															onClick={(e) => {
+																e.preventDefault();
+																e.stopPropagation();
+																handleEdit(
+																	coverFile,
+																);
+															}}
+															className="px-3 py-1.5 text-xs font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors flex items-center gap-1"
+														>
+															Review & Amend
+														</button>
+													)}
+											</div>
 										</div>
 
 										<p className="text-xs text-slate-500 mt-1">
@@ -1144,7 +1778,13 @@ export default function App() {
 						{coverFile && (
 							<div className="mt-3 flex justify-end">
 								<button
-									onClick={() => setCoverFile(null)}
+									onClick={() => {
+										if (coverFile) {
+											bytesStoreRef.current.delete(coverFile.id);
+											originalBytesStoreRef.current.delete(coverFile.id);
+										}
+										setCoverFile(null);
+									}}
 									className="text-sm text-red-500 hover:text-red-700 font-medium flex items-center gap-1"
 								>
 									<Trash2 className="w-4 h-4" /> Remove
@@ -1166,7 +1806,7 @@ export default function App() {
 						<p className="text-slate-500 text-sm mb-6">
 							Upload the documents to be appended. A "TAB-x" page
 							will be inserted before each document automatically.
-							Drag to reorder.
+							Drag to reorder. Uploads are auto-fixed (A4 + portrait/text orientation checks).
 						</p>
 
 						<label
@@ -1390,14 +2030,20 @@ export default function App() {
 				/>
 			)}
 
-			{editingFile && bytesStoreRef.current.get(editingFile.id) && (
-				<PageEditorModal
-					file={editingFile}
-					fileBytes={bytesStoreRef.current.get(editingFile.id)!}
-					onClose={() => setEditingFile(null)}
-					onSave={handleSaveEdit}
-				/>
-			)}
+			{editingFile &&
+				bytesStoreRef.current.get(editingFile.id) &&
+				editingOriginalBytes && (
+					<PageEditorModal
+						file={editingFile}
+						fileBytes={bytesStoreRef.current.get(editingFile.id)!}
+						originalFileBytes={editingOriginalBytes}
+						onClose={() => {
+							setEditingFile(null);
+							setEditingOriginalBytes(null);
+						}}
+						onSave={handleSaveEdit}
+					/>
+				)}
 		</div>
 	);
 }

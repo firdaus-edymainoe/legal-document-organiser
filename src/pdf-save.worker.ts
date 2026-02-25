@@ -1,4 +1,11 @@
-import { PDFDocument, PageSizes, degrees } from "pdf-lib";
+import {
+	PDFDocument,
+	PageSizes,
+	degrees,
+	PDFName,
+	PDFArray,
+	PDFNumber,
+} from "pdf-lib";
 
 export type PageModification =
 	| { type: "rotate"; pageIndices: number[]; angle: number }
@@ -9,6 +16,7 @@ export interface WorkerRequest {
 	bytes?: Uint8Array; // omit when useCachedBytes
 	modifications: PageModification[];
 	pageIndex?: number; // for preview
+	fullDocumentPreview?: boolean; // when true, return all pages for scrolling preview
 	requestId?: number; // for preview - to ignore stale responses
 	useCachedBytes?: boolean; // use bytes from first transfer
 }
@@ -23,30 +31,33 @@ function getIssuesFromDoc(doc: PDFDocument) {
 		const { width, height } = page.getSize();
 		const rotation = page.getRotation();
 
-		const effectiveWidth = rotation.angle % 180 === 0 ? width : height;
-		const effectiveHeight = rotation.angle % 180 === 0 ? height : width;
-
-		const isPortrait = effectiveHeight >= effectiveWidth;
-
+		const isPortrait = height >= width;
+		const isPortraitRotation = rotation.angle % 180 === 0;
 		const isA4Dimensions =
-			(Math.abs(width - A4_WIDTH) <= 5 &&
-				Math.abs(height - A4_HEIGHT) <= 5) ||
-			(Math.abs(width - A4_HEIGHT) <= 5 &&
-				Math.abs(height - A4_WIDTH) <= 5);
+			Math.abs(width - A4_WIDTH) <= 5 && Math.abs(height - A4_HEIGHT) <= 5;
 
-		if (!isPortrait || !isA4Dimensions) {
+		if (!isPortrait || !isA4Dimensions || !isPortraitRotation) {
 			let type: "size" | "orientation" | "both" = "size";
 			const parts: string[] = [];
 
 			if (!isPortrait) {
-				parts.push("Landscape");
+				parts.push("Landscape Page Box");
 				type = "orientation";
 			}
 			if (!isA4Dimensions) {
 				parts.push("Non-A4 Size");
 				type = "size";
 			}
-			if (!isPortrait && !isA4Dimensions) type = "both";
+			if (!isPortraitRotation) {
+				parts.push("Sideways Page Rotation");
+				type = "orientation";
+			}
+			if (
+				(!isPortrait || !isPortraitRotation) &&
+				!isA4Dimensions
+			) {
+				type = "both";
+			}
 
 			issues.push({
 				pageIndex: index,
@@ -93,10 +104,57 @@ function applyModifications(
 					const dy = (A4_HEIGHT - scaledHeight) / 2;
 
 					page.setSize(A4_WIDTH, A4_HEIGHT);
-					page.translateContent(dx, dy);
 					page.scaleContent(scale, scale);
+					page.translateContent(dx, dy);
+					scaleAndTranslatePageAnnotations(page, scale, dx, dy);
 				}
 			}
+		}
+	}
+}
+
+function scaleAndTranslateAnnotationArray(
+	array: PDFArray,
+	scale: number,
+	dx: number,
+	dy: number,
+) {
+	for (let i = 0; i + 1 < array.size(); i += 2) {
+		const xObj = array.get(i);
+		const yObj = array.get(i + 1);
+		if (!(xObj instanceof PDFNumber) || !(yObj instanceof PDFNumber)) continue;
+		array.set(i, PDFNumber.of(xObj.asNumber() * scale + dx));
+		array.set(i + 1, PDFNumber.of(yObj.asNumber() * scale + dy));
+	}
+}
+
+function scaleAndTranslatePageAnnotations(
+	page: ReturnType<PDFDocument["getPage"]>,
+	scale: number,
+	dx: number,
+	dy: number,
+) {
+	const annots = page.node.lookupMaybe(PDFName.of("Annots"), PDFArray);
+	if (!annots) return;
+
+	for (let i = 0; i < annots.size(); i++) {
+		const annotRef = annots.get(i);
+		const annotDict = page.doc.context.lookup(annotRef);
+		if (!annotDict || typeof (annotDict as any).lookupMaybe !== "function") {
+			continue;
+		}
+
+		const rect = (annotDict as any).lookupMaybe(PDFName.of("Rect"), PDFArray);
+		if (rect instanceof PDFArray) {
+			scaleAndTranslateAnnotationArray(rect, scale, dx, dy);
+		}
+
+		const quadPoints = (annotDict as any).lookupMaybe(
+			PDFName.of("QuadPoints"),
+			PDFArray,
+		);
+		if (quadPoints instanceof PDFArray) {
+			scaleAndTranslateAnnotationArray(quadPoints, scale, dx, dy);
 		}
 	}
 }
@@ -120,6 +178,7 @@ async function handlePreview(
 	bytes: Uint8Array,
 	modifications: PageModification[],
 	pageIndex: number,
+	fullDocumentPreview: boolean,
 ): Promise<Uint8Array> {
 	// Parse once, re-use across preview requests for the same file
 	const sourceDoc = await getOrParseDoc(bytes);
@@ -127,6 +186,10 @@ async function handlePreview(
 	// Work on a lightweight copy so modifications don't accumulate on the cached doc
 	const workDoc = await PDFDocument.load(await sourceDoc.save(), { updateMetadata: false });
 	applyModifications(workDoc, modifications);
+
+	if (fullDocumentPreview) {
+		return workDoc.save();
+	}
 
 	const tempDoc = await PDFDocument.create();
 	const [copiedPage] = await tempDoc.copyPages(workDoc, [pageIndex]);
@@ -181,8 +244,14 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 	try {
 		if (type === "preview") {
 			const pageIndex = e.data.pageIndex ?? 0;
+			const fullDocumentPreview = e.data.fullDocumentPreview ?? false;
 			const requestId = e.data.requestId;
-			const previewBytes = await handlePreview(bytes, modifications, pageIndex);
+			const previewBytes = await handlePreview(
+				bytes,
+				modifications,
+				pageIndex,
+				fullDocumentPreview,
+			);
 			self.postMessage(
 				{ type: "preview", ok: true, bytes: previewBytes, requestId },
 				{ transfer: [previewBytes.buffer as ArrayBuffer] },

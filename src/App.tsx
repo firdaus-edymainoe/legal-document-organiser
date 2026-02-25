@@ -19,6 +19,7 @@ import {
 	Download,
 	FilePlus,
 	ArrowRight,
+	ArrowLeft,
 	Loader2,
 	Eye,
 	X,
@@ -29,6 +30,7 @@ import {
 	RotateCcw,
 	Maximize,
 	Layers,
+	Wrench,
 } from "lucide-react";
 import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/AnnotationLayer.css";
@@ -52,7 +54,58 @@ import {
 	useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { Link, Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { cn } from "./lib/utils";
+
+interface PageHeaderProps {
+	icon: React.ReactNode;
+	title: string;
+	subtitle?: string;
+	showBackButton?: boolean;
+	maxWidth?: string;
+}
+
+function PageHeader({
+	icon,
+	title,
+	subtitle,
+	showBackButton = false,
+	maxWidth = "max-w-5xl",
+}: PageHeaderProps) {
+	const navigate = useNavigate();
+
+	return (
+		<header className="bg-white border-b border-slate-200 sticky top-0 z-20">
+			<div className={cn("mx-auto px-6 py-4 flex items-center gap-3", maxWidth)}>
+				{showBackButton ? (
+					<button
+						onClick={() => navigate("/")}
+						className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 text-slate-600 hover:text-slate-900 hover:bg-slate-100 transition-colors text-sm font-medium"
+						title="Back to feature selection"
+					>
+						<ArrowLeft className="w-4 h-4" />
+						Back
+					</button>
+				) : null}
+				<div className="flex items-center gap-3">
+					<div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center shadow-sm">
+						{icon}
+					</div>
+					<div>
+						<h1 className="text-xl font-semibold text-slate-900 tracking-tight">
+							{title}
+						</h1>
+						{subtitle && (
+							<p className="text-sm text-slate-500 font-medium">
+								{subtitle}
+							</p>
+						)}
+					</div>
+				</div>
+			</div>
+		</header>
+	);
+}
 
 // Configure PDF.js worker
 pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
@@ -1250,7 +1303,7 @@ function PdfPreviewModal({
 	);
 }
 
-export default function App() {
+function BundleOfAuthoritiesPage() {
 	const [coverFile, setCoverFile] = useState<PdfFile | null>(null);
 	const [individualFiles, setIndividualFiles] = useState<PdfFile[]>([]);
 	const bytesStoreRef = useRef<Map<string, Uint8Array>>(new Map());
@@ -1760,21 +1813,12 @@ export default function App() {
 
 	return (
 		<div className="min-h-screen bg-slate-50 text-slate-900 font-sans selection:bg-indigo-100 selection:text-indigo-900 pb-24">
-			<header className="bg-white border-b border-slate-200 sticky top-0 z-20">
-				<div className="max-w-5xl mx-auto px-6 py-4 flex items-center gap-3">
-					<div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center shadow-sm">
-						<FileText className="w-5 h-5 text-white" />
-					</div>
-					<div>
-						<h1 className="text-xl font-semibold text-slate-900 tracking-tight">
-							Legal Document Organiser
-						</h1>
-						<p className="text-sm text-slate-500 font-medium">
-							Prepare court bundles and submissions
-						</p>
-					</div>
-				</div>
-			</header>
+			<PageHeader
+				icon={<FileText className="w-5 h-5 text-white" />}
+				title="Bundle of Authorities"
+				subtitle="Compile cover/index, TAB pages, and merged bundle output"
+				showBackButton
+			/>
 
 			<main className="max-w-5xl mx-auto px-6 py-10 grid grid-cols-1 lg:grid-cols-12 gap-10">
 				<div className="lg:col-span-7 space-y-8">
@@ -2043,7 +2087,7 @@ export default function App() {
 										onClick={() => {
 											setPreviewUrl(generatedPdfUrl);
 											setPreviewTitle(
-												"Submission_Bundle.pdf",
+												"Bundle_of_Authorities.pdf",
 											);
 										}}
 										className="flex-1 py-3 px-4 bg-slate-800 hover:bg-slate-700 text-white rounded-xl font-medium transition-colors flex items-center justify-center gap-2"
@@ -2053,7 +2097,7 @@ export default function App() {
 									</button>
 									<a
 										href={generatedPdfUrl}
-										download="Submission_Bundle.pdf"
+										download="Bundle_of_Authorities.pdf"
 										className="flex-1 py-3 px-4 bg-white text-slate-900 hover:bg-slate-100 rounded-xl font-medium transition-colors flex items-center justify-center gap-2"
 									>
 										<Download className="w-5 h-5" />
@@ -2164,5 +2208,269 @@ export default function App() {
 					/>
 				)}
 		</div>
+	);
+}
+
+function PdfPageFixerPage() {
+	const [uploadedFile, setUploadedFile] = useState<PdfFile | null>(null);
+	const [fileBytes, setFileBytes] = useState<Uint8Array | null>(null);
+	const [originalBytes, setOriginalBytes] = useState<Uint8Array | null>(null);
+	const [isDragging, setIsDragging] = useState(false);
+	const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+	const [previewTitle, setPreviewTitle] = useState<string | null>(null);
+	const [isEditing, setIsEditing] = useState(false);
+
+	useEffect(() => {
+		return () => {
+			if (previewUrl) {
+				URL.revokeObjectURL(previewUrl);
+			}
+		};
+	}, [previewUrl]);
+
+	const processFile = async (file: File) => {
+		if (file.type !== "application/pdf") return;
+
+		const bytes = new Uint8Array(await file.arrayBuffer());
+		const doc = await PDFDocument.load(bytes, { updateMetadata: false });
+		const issues = getIssuesFromDoc(doc);
+		setUploadedFile({
+			id: crypto.randomUUID(),
+			name: file.name,
+			file,
+			pageCount: doc.getPageCount(),
+			issues: issues.length > 0 ? issues : undefined,
+		});
+		setFileBytes(bytes);
+		setOriginalBytes(bytes);
+		setIsEditing(false);
+	};
+
+	const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+		const file = e.target.files?.[0];
+		if (!file) return;
+		await processFile(file);
+	};
+
+	const handleDrop = async (e: React.DragEvent) => {
+		e.preventDefault();
+		setIsDragging(false);
+		const file = e.dataTransfer.files?.[0];
+		if (!file) return;
+		await processFile(file);
+	};
+
+	const handlePreview = () => {
+		if (!uploadedFile || !fileBytes) return;
+		setPreviewUrl((current) => {
+			if (current) URL.revokeObjectURL(current);
+			return URL.createObjectURL(new Blob([fileBytes], { type: "application/pdf" }));
+		});
+		setPreviewTitle(uploadedFile.name);
+	};
+
+	const handleDownload = () => {
+		if (!uploadedFile || !fileBytes) return;
+		const url = URL.createObjectURL(new Blob([fileBytes], { type: "application/pdf" }));
+		const link = document.createElement("a");
+		link.href = url;
+		link.download = `${uploadedFile.name.replace(/\.pdf$/i, "")}_fixed.pdf`;
+		document.body.appendChild(link);
+		link.click();
+		document.body.removeChild(link);
+		URL.revokeObjectURL(url);
+	};
+
+	const handleSaveEdit = (updatedFile: PdfFile, newBytes: Uint8Array) => {
+		setUploadedFile((prev) =>
+			prev
+				? { ...updatedFile, file: prev.file }
+				: { ...updatedFile, file: updatedFile.file },
+		);
+		setFileBytes(newBytes);
+		setOriginalBytes(new Uint8Array(newBytes));
+		setIsEditing(false);
+	};
+
+	return (
+		<div className="min-h-screen bg-slate-50 text-slate-900 font-sans selection:bg-indigo-100 selection:text-indigo-900">
+			<PageHeader
+				icon={<Wrench className="w-5 h-5 text-white" />}
+				title="PDF Page Fixer"
+				subtitle="Choose a PDF page and apply rotation/scaling fixes only"
+				showBackButton
+				maxWidth="max-w-4xl"
+			/>
+
+			<main className="max-w-4xl mx-auto px-6 py-10">
+				<section className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6">
+					<div>
+						<h2 className="text-lg font-semibold">Upload PDF</h2>
+						<p className="text-slate-500 text-sm mt-1">
+							This tool only applies page rotation and A4 scaling fixes. It does not compile documents.
+						</p>
+					</div>
+
+					<label
+						className={cn(
+							"flex flex-col items-center justify-center w-full h-44 border-2 border-dashed rounded-xl cursor-pointer transition-colors",
+							isDragging
+								? "border-indigo-500 bg-indigo-100"
+								: uploadedFile
+									? "border-indigo-300 bg-indigo-50/50"
+									: "border-slate-300 bg-slate-50 hover:bg-slate-100 hover:border-slate-400",
+						)}
+						onDragOver={(e) => {
+							e.preventDefault();
+							setIsDragging(true);
+						}}
+						onDragLeave={(e) => {
+							e.preventDefault();
+							setIsDragging(false);
+						}}
+						onDrop={handleDrop}
+					>
+						<div className="flex flex-col items-center justify-center px-4 text-center">
+							{uploadedFile ? (
+								<>
+									<FileText className="w-8 h-8 text-indigo-500 mb-2" />
+									<p className="text-sm font-medium text-slate-700">{uploadedFile.name}</p>
+									<p className="text-xs text-slate-500 mt-1">
+										{uploadedFile.pageCount} {uploadedFile.pageCount === 1 ? "page" : "pages"}
+									</p>
+									{uploadedFile.issues && uploadedFile.issues.length > 0 && (
+										<span className="mt-2 flex items-center gap-1 text-xs font-medium text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">
+											<AlertTriangle className="w-3 h-3" />
+											{uploadedFile.issues.length} issue{uploadedFile.issues.length > 1 ? "s" : ""} detected
+										</span>
+									)}
+									<p className="text-xs text-slate-500 mt-2">Click to replace</p>
+								</>
+							) : (
+								<>
+									<FileUp className="w-8 h-8 text-slate-400 mb-2" />
+									<p className="text-sm font-medium text-slate-700">Click to upload or drag and drop PDF</p>
+									<p className="text-xs text-slate-500 mt-1">Single PDF file</p>
+								</>
+							)}
+						</div>
+						<input
+							type="file"
+							className="hidden"
+							accept="application/pdf"
+							onChange={handleUpload}
+						/>
+					</label>
+
+					{uploadedFile && fileBytes && originalBytes ? (
+						<div className="flex flex-wrap gap-3">
+							<button
+								onClick={() => setIsEditing(true)}
+								className="px-4 py-2 text-sm font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors"
+							>
+								Open Page Fixer
+							</button>
+							<button
+								onClick={handlePreview}
+								className="px-4 py-2 text-sm font-medium text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg transition-colors flex items-center gap-2"
+							>
+								<Eye className="w-4 h-4" />
+								Preview
+							</button>
+							<button
+								onClick={handleDownload}
+								className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors flex items-center gap-2"
+							>
+								<Download className="w-4 h-4" />
+								Download Fixed PDF
+							</button>
+							<button
+								onClick={() => {
+									setUploadedFile(null);
+									setFileBytes(null);
+									setOriginalBytes(null);
+								}}
+								className="px-4 py-2 text-sm font-medium text-red-600 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg transition-colors flex items-center gap-2"
+							>
+								<Trash2 className="w-4 h-4" />
+								Remove
+							</button>
+						</div>
+					) : null}
+				</section>
+			</main>
+
+			{previewUrl && previewTitle && (
+				<PdfPreviewModal
+					url={previewUrl}
+					title={previewTitle}
+					onClose={() => {
+						if (previewUrl) URL.revokeObjectURL(previewUrl);
+						setPreviewUrl(null);
+						setPreviewTitle(null);
+					}}
+				/>
+			)}
+
+			{isEditing && uploadedFile && fileBytes && originalBytes ? (
+				<PageEditorModal
+					file={uploadedFile}
+					fileBytes={fileBytes}
+					originalFileBytes={originalBytes}
+					onClose={() => setIsEditing(false)}
+					onSave={handleSaveEdit}
+				/>
+			) : null}
+		</div>
+	);
+}
+
+function LandingPage() {
+	return (
+		<div className="min-h-screen bg-slate-50 text-slate-900 font-sans selection:bg-indigo-100 selection:text-indigo-900">
+			<PageHeader
+				icon={<FileText className="w-5 h-5 text-white" />}
+				title="Legal Document Organiser"
+				subtitle="Choose a feature to continue"
+			/>
+			<main className="max-w-5xl mx-auto px-6 py-10 grid grid-cols-1 md:grid-cols-2 gap-6">
+				<Link
+					to="/bundle-of-authorities"
+					className="text-left bg-white border border-slate-200 rounded-2xl p-6 shadow-sm hover:shadow-md hover:border-indigo-300 transition-all"
+				>
+					<div className="w-11 h-11 rounded-xl bg-indigo-600 text-white flex items-center justify-center mb-4">
+						<FileText className="w-5 h-5" />
+					</div>
+					<h2 className="text-lg font-semibold">Bundle of Authorities</h2>
+					<p className="text-sm text-slate-500 mt-2">
+						Compile cover/index with multiple documents, auto-insert TAB-x pages, and export one merged bundle.
+					</p>
+				</Link>
+
+				<Link
+					to="/pdf-page-fixer"
+					className="text-left bg-white border border-slate-200 rounded-2xl p-6 shadow-sm hover:shadow-md hover:border-indigo-300 transition-all"
+				>
+					<div className="w-11 h-11 rounded-xl bg-slate-900 text-white flex items-center justify-center mb-4">
+						<Wrench className="w-5 h-5" />
+					</div>
+					<h2 className="text-lg font-semibold">PDF Page Fixer</h2>
+					<p className="text-sm text-slate-500 mt-2">
+						Open a single PDF and manually choose pages to rotate or fit to A4 with before/after review.
+					</p>
+				</Link>
+			</main>
+		</div>
+	);
+}
+
+export default function App() {
+	return (
+		<Routes>
+			<Route path="/" element={<LandingPage />} />
+			<Route path="/bundle-of-authorities" element={<BundleOfAuthoritiesPage />} />
+			<Route path="/pdf-page-fixer" element={<PdfPageFixerPage />} />
+			<Route path="*" element={<Navigate to="/" replace />} />
+		</Routes>
 	);
 }

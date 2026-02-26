@@ -6,6 +6,7 @@ import {
 	PDFArray,
 	PDFNumber,
 } from "pdf-lib";
+import { loadPdfForEditing, normalizePdfForEditing } from "./lib/pdf-security";
 
 export type PageModification =
 	| { type: "rotate"; pageIndices: number[]; angle: number }
@@ -22,50 +23,64 @@ export interface WorkerRequest {
 }
 
 function getIssuesFromDoc(doc: PDFDocument) {
-	const pages = doc.getPages();
 	const [A4_WIDTH, A4_HEIGHT] = PageSizes.A4;
 	const issues: { pageIndex: number; issueType: string; description: string }[] =
 		[];
+	let pageCount = 0;
+	try {
+		pageCount = doc.getPageCount();
+	} catch {
+		return issues;
+	}
 
-	pages.forEach((page, index) => {
-		const { width, height } = page.getSize();
-		const rotation = page.getRotation();
+	for (let index = 0; index < pageCount; index++) {
+		try {
+			const page = doc.getPage(index);
+			const { width, height } = page.getSize();
+			const rotation = page.getRotation();
 
-		const isPortrait = height >= width;
-		const isPortraitRotation = rotation.angle % 180 === 0;
-		const isA4Dimensions =
-			Math.abs(width - A4_WIDTH) <= 5 && Math.abs(height - A4_HEIGHT) <= 5;
+			const isPortrait = height >= width;
+			const isPortraitRotation = rotation.angle % 180 === 0;
+			const isA4Dimensions =
+				Math.abs(width - A4_WIDTH) <= 5 && Math.abs(height - A4_HEIGHT) <= 5;
 
-		if (!isPortrait || !isA4Dimensions || !isPortraitRotation) {
-			let type: "size" | "orientation" | "both" = "size";
-			const parts: string[] = [];
+			if (!isPortrait || !isA4Dimensions || !isPortraitRotation) {
+				let type: "size" | "orientation" | "both" = "size";
+				const parts: string[] = [];
 
-			if (!isPortrait) {
-				parts.push("Landscape Page Box");
-				type = "orientation";
+				if (!isPortrait) {
+					parts.push("Landscape Page Box");
+					type = "orientation";
+				}
+				if (!isA4Dimensions) {
+					parts.push("Non-A4 Size");
+					type = "size";
+				}
+				if (!isPortraitRotation) {
+					parts.push("Sideways Page Rotation");
+					type = "orientation";
+				}
+				if (
+					(!isPortrait || !isPortraitRotation) &&
+					!isA4Dimensions
+				) {
+					type = "both";
+				}
+
+				issues.push({
+					pageIndex: index,
+					issueType: type,
+					description: parts.join(", "),
+				});
 			}
-			if (!isA4Dimensions) {
-				parts.push("Non-A4 Size");
-				type = "size";
-			}
-			if (!isPortraitRotation) {
-				parts.push("Sideways Page Rotation");
-				type = "orientation";
-			}
-			if (
-				(!isPortrait || !isPortraitRotation) &&
-				!isA4Dimensions
-			) {
-				type = "both";
-			}
-
+		} catch {
 			issues.push({
 				pageIndex: index,
-				issueType: type,
-				description: parts.join(", "),
+				issueType: "both",
+				description: "Malformed page object",
 			});
 		}
-	});
+	}
 
 	return issues;
 }
@@ -82,31 +97,39 @@ function applyModifications(
 		if (mod.type === "rotate") {
 			for (let i = 0; i < pageCount; i++) {
 				if (indices.has(i)) {
-					const page = doc.getPage(i);
-					const rotation = page.getRotation();
-					page.setRotation(degrees(rotation.angle + mod.angle));
+					try {
+						const page = doc.getPage(i);
+						const rotation = page.getRotation();
+						page.setRotation(degrees(rotation.angle + mod.angle));
+					} catch {
+						// Ignore malformed pages.
+					}
 				}
 			}
 		} else if (mod.type === "fitToA4") {
 			const [A4_WIDTH, A4_HEIGHT] = PageSizes.A4;
 			for (let i = 0; i < pageCount; i++) {
 				if (indices.has(i)) {
-					const page = doc.getPage(i);
-					const { width, height } = page.getSize();
+					try {
+						const page = doc.getPage(i);
+						const { width, height } = page.getSize();
 
-					const scale = Math.min(
-						A4_WIDTH / width,
-						A4_HEIGHT / height,
-					);
-					const scaledWidth = width * scale;
-					const scaledHeight = height * scale;
-					const dx = (A4_WIDTH - scaledWidth) / 2;
-					const dy = (A4_HEIGHT - scaledHeight) / 2;
+						const scale = Math.min(
+							A4_WIDTH / width,
+							A4_HEIGHT / height,
+						);
+						const scaledWidth = width * scale;
+						const scaledHeight = height * scale;
+						const dx = (A4_WIDTH - scaledWidth) / 2;
+						const dy = (A4_HEIGHT - scaledHeight) / 2;
 
-					page.setSize(A4_WIDTH, A4_HEIGHT);
-					page.scaleContent(scale, scale);
-					page.translateContent(dx, dy);
-					scaleAndTranslatePageAnnotations(page, scale, dx, dy);
+						page.setSize(A4_WIDTH, A4_HEIGHT);
+						page.scaleContent(scale, scale);
+						page.translateContent(dx, dy);
+						scaleAndTranslatePageAnnotations(page, scale, dx, dy);
+					} catch {
+						// Ignore malformed pages.
+					}
 				}
 			}
 		}
@@ -134,28 +157,36 @@ function scaleAndTranslatePageAnnotations(
 	dx: number,
 	dy: number,
 ) {
-	const annots = page.node.lookupMaybe(PDFName.of("Annots"), PDFArray);
-	if (!annots) return;
+	try {
+		const annots = page.node.lookupMaybe(PDFName.of("Annots"), PDFArray);
+		if (!annots) return;
 
-	for (let i = 0; i < annots.size(); i++) {
-		const annotRef = annots.get(i);
-		const annotDict = page.doc.context.lookup(annotRef);
-		if (!annotDict || typeof (annotDict as any).lookupMaybe !== "function") {
-			continue;
-		}
+		for (let i = 0; i < annots.size(); i++) {
+			try {
+				const annotRef = annots.get(i);
+				const annotDict = page.doc.context.lookup(annotRef);
+				if (!annotDict || typeof (annotDict as any).lookupMaybe !== "function") {
+					continue;
+				}
 
-		const rect = (annotDict as any).lookupMaybe(PDFName.of("Rect"), PDFArray);
-		if (rect instanceof PDFArray) {
-			scaleAndTranslateAnnotationArray(rect, scale, dx, dy);
-		}
+				const rect = (annotDict as any).lookupMaybe(PDFName.of("Rect"), PDFArray);
+				if (rect instanceof PDFArray) {
+					scaleAndTranslateAnnotationArray(rect, scale, dx, dy);
+				}
 
-		const quadPoints = (annotDict as any).lookupMaybe(
-			PDFName.of("QuadPoints"),
-			PDFArray,
-		);
-		if (quadPoints instanceof PDFArray) {
-			scaleAndTranslateAnnotationArray(quadPoints, scale, dx, dy);
+				const quadPoints = (annotDict as any).lookupMaybe(
+					PDFName.of("QuadPoints"),
+					PDFArray,
+				);
+				if (quadPoints instanceof PDFArray) {
+					scaleAndTranslateAnnotationArray(quadPoints, scale, dx, dy);
+				}
+			} catch {
+				// Ignore malformed annotation references.
+			}
 		}
+	} catch {
+		// Ignore malformed annotation collections.
 	}
 }
 
@@ -169,8 +200,9 @@ async function getOrParseDoc(bytes: Uint8Array): Promise<PDFDocument> {
 	if (cachedDoc && cachedBytes === bytes) {
 		return cachedDoc;
 	}
-	cachedDoc = await PDFDocument.load(bytes, { updateMetadata: false });
-	cachedBytes = bytes;
+	const { bytes: editableBytes } = await normalizePdfForEditing(bytes);
+	cachedDoc = await loadPdfForEditing(editableBytes);
+	cachedBytes = editableBytes;
 	return cachedDoc;
 }
 
@@ -184,7 +216,7 @@ async function handlePreview(
 	const sourceDoc = await getOrParseDoc(bytes);
 
 	// Work on a lightweight copy so modifications don't accumulate on the cached doc
-	const workDoc = await PDFDocument.load(await sourceDoc.save(), { updateMetadata: false });
+	const workDoc = await loadPdfForEditing(await sourceDoc.save());
 	applyModifications(workDoc, modifications);
 
 	if (fullDocumentPreview) {
@@ -204,7 +236,8 @@ async function handleSave(
 	bytes: Uint8Array,
 	modifications: PageModification[],
 ): Promise<{ bytes: Uint8Array; issues: ReturnType<typeof getIssuesFromDoc> }> {
-	const doc = await PDFDocument.load(bytes, { updateMetadata: false });
+	const { bytes: editableBytes } = await normalizePdfForEditing(bytes);
+	const doc = await loadPdfForEditing(editableBytes);
 
 	// Apply all modifications directly to the existing pages — no copies needed
 	applyModifications(doc, modifications);

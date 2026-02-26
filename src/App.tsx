@@ -55,6 +55,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { Link, Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { loadPdfForEditing, normalizePdfForEditing } from "./lib/pdf-security";
 import { cn } from "./lib/utils";
 
 interface PageHeaderProps {
@@ -116,6 +117,8 @@ interface PageIssue {
 	description: string;
 }
 
+type ProcessingStage = "uploading" | "scanning" | "autofixing";
+
 interface PdfFile {
 	id: string;
 	name: string;
@@ -125,6 +128,9 @@ interface PdfFile {
 	autoFixApplied?: boolean;
 	autoFixSummary?: string;
 	autoFixedPageFixTypes?: Record<number, ("rotation" | "scaling")[]>;
+	imageOnly?: boolean;
+	processingStage?: ProcessingStage;
+	processingError?: string;
 }
 
 interface TabInfo {
@@ -139,6 +145,59 @@ type PageModification =
 
 const RIGHT_ANGLES = [0, 90, 180, 270] as const;
 const TEXT_ORIENTATION_TOLERANCE_DEG = 20;
+const IMAGE_ONLY_NOTICE =
+	"Image-only PDF: protection was removed by rasterizing pages. Text is not selectable or highlightable.";
+const PDF_POINTS_PER_INCH = 72;
+const RASTER_TARGET_DPI = 300;
+const RASTER_MAX_PIXELS = 20_000_000;
+
+interface EditablePdfPreparation {
+	bytes: Uint8Array;
+	imageOnly: boolean;
+}
+
+function getProcessingStageLabel(stage: ProcessingStage): string {
+	switch (stage) {
+		case "uploading":
+			return "Uploading";
+		case "scanning":
+			return "Scanning issues";
+		case "autofixing":
+			return "Auto-fixing";
+		default:
+			return "Processing";
+	}
+}
+
+function ImageOnlyBadge({ className }: { className?: string }) {
+	return (
+		<span className={cn("relative inline-flex group", className)}>
+			<span
+				tabIndex={0}
+				className="flex items-center gap-1 text-xs font-medium text-rose-700 bg-rose-50 px-2 py-0.5 rounded-full border border-rose-200 cursor-help focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-300"
+				aria-label="Image-only PDF details"
+			>
+				<AlertTriangle className="w-3 h-3" />
+				Image-Only
+			</span>
+			<span
+				role="tooltip"
+				className="pointer-events-none absolute left-1/2 top-full z-30 mt-2 w-64 max-w-[80vw] -translate-x-1/2 translate-y-1 rounded-md border border-rose-200 bg-white px-3 py-2 text-[11px] font-medium leading-snug text-rose-700 shadow-lg opacity-0 transition-all duration-150 group-hover:translate-y-0 group-hover:opacity-100 group-focus-within:translate-y-0 group-focus-within:opacity-100"
+			>
+				{IMAGE_ONLY_NOTICE}
+			</span>
+		</span>
+	);
+}
+
+function withImageOnlyNotice(
+	summary: string | undefined,
+	imageOnly: boolean,
+): string | undefined {
+	if (!imageOnly) return summary;
+	if (summary?.includes(IMAGE_ONLY_NOTICE)) return summary;
+	return `${summary ? `${summary} ` : ""}${IMAGE_ONLY_NOTICE}`;
+}
 
 function normalizeAngle(angle: number): number {
 	const normalized = angle % 360;
@@ -272,6 +331,164 @@ async function detectDominantTextAngles(pdfBytes: Uint8Array): Promise<(number |
 	}
 }
 
+async function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> {
+	return new Promise((resolve, reject) => {
+		canvas.toBlob(
+			(blob) => {
+				if (!blob) {
+					reject(new Error("Failed to encode canvas image"));
+					return;
+				}
+				blob
+					.arrayBuffer()
+					.then((buffer) => resolve(new Uint8Array(buffer)))
+					.catch(reject);
+			},
+			"image/png",
+		);
+	});
+}
+
+async function loadPdfJsWithPasswordPrompt(pdfBytes: Uint8Array): Promise<{
+	loadingTask: any;
+	pdf: any;
+}> {
+	let password: string | undefined;
+
+	while (true) {
+		const loadingTask = pdfjs.getDocument({
+			data: new Uint8Array(pdfBytes),
+			stopAtErrors: false,
+			...(password !== undefined ? { password } : {}),
+		});
+
+		try {
+			const pdf = await loadingTask.promise;
+			return { loadingTask, pdf };
+		} catch (error) {
+			await loadingTask.destroy().catch(() => {});
+			const name = (error as any)?.name;
+			const message = String((error as any)?.message ?? "");
+			const isPasswordError =
+				name === "PasswordException" ||
+				message.toLowerCase().includes("password");
+			if (!isPasswordError) {
+				throw error;
+			}
+
+			const nextPassword = window.prompt(
+				password === undefined
+					? "This PDF is password protected. Enter the password to continue."
+					: "Incorrect password. Enter the PDF password to continue, or press Cancel to stop.",
+				"",
+			);
+			if (nextPassword === null) {
+				throw new Error("Password is required to open this PDF.");
+			}
+			password = nextPassword;
+		}
+	}
+}
+
+async function rasterizePdfToEditableA4(pdfBytes: Uint8Array): Promise<Uint8Array> {
+	const { loadingTask, pdf } = await loadPdfJsWithPasswordPrompt(pdfBytes);
+
+	try {
+		const rebuiltDoc = await PDFDocument.create();
+		const [A4_WIDTH, A4_HEIGHT] = PageSizes.A4;
+
+		for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+			const page = await pdf.getPage(pageNumber);
+			const baseViewport = page.getViewport({ scale: 1 });
+			let renderScale = RASTER_TARGET_DPI / PDF_POINTS_PER_INCH;
+			const estimatedPixels =
+				baseViewport.width * baseViewport.height * renderScale * renderScale;
+			if (estimatedPixels > RASTER_MAX_PIXELS) {
+				renderScale = Math.sqrt(
+					RASTER_MAX_PIXELS / Math.max(1, baseViewport.width * baseViewport.height),
+				);
+			}
+			const viewport = page.getViewport({ scale: renderScale });
+			const canvas = document.createElement("canvas");
+			const context = canvas.getContext("2d", { alpha: false });
+			if (!context) {
+				throw new Error("Canvas 2D context is unavailable");
+			}
+
+			canvas.width = Math.max(1, Math.ceil(viewport.width));
+			canvas.height = Math.max(1, Math.ceil(viewport.height));
+			context.fillStyle = "#ffffff";
+			context.fillRect(0, 0, canvas.width, canvas.height);
+
+			await page.render({
+				canvas,
+				canvasContext: context,
+				viewport,
+			}).promise;
+
+			const imageBytes = await canvasToPngBytes(canvas);
+			const image = await rebuiltDoc.embedPng(imageBytes);
+			const outputPage = rebuiltDoc.addPage([A4_WIDTH, A4_HEIGHT]);
+
+			const scale = Math.min(A4_WIDTH / image.width, A4_HEIGHT / image.height);
+			const width = image.width * scale;
+			const height = image.height * scale;
+			outputPage.drawImage(image, {
+				x: (A4_WIDTH - width) / 2,
+				y: (A4_HEIGHT - height) / 2,
+				width,
+				height,
+			});
+
+			page.cleanup();
+			canvas.width = 0;
+			canvas.height = 0;
+		}
+
+		return rebuiltDoc.save({
+			useObjectStreams: true,
+			objectsPerTick: 100,
+		});
+	} finally {
+		await loadingTask.destroy();
+	}
+}
+
+async function canReadAllPages(bytes: Uint8Array): Promise<boolean> {
+	try {
+		const doc = await loadPdfForEditing(bytes);
+		const pageCount = doc.getPageCount();
+		for (let i = 0; i < pageCount; i++) {
+			const page = doc.getPage(i);
+			page.getSize();
+			page.getRotation();
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function prepareEditablePdfBytes(
+	pdfBytes: Uint8Array,
+): Promise<EditablePdfPreparation> {
+	const normalized = await normalizePdfForEditing(pdfBytes);
+	const canReadNormalized = await canReadAllPages(normalized.bytes);
+
+	if (!normalized.bypassApplied && canReadNormalized) {
+		return {
+			bytes: normalized.bytes,
+			imageOnly: false,
+		};
+	}
+
+	const rasterizedBytes = await rasterizePdfToEditableA4(pdfBytes);
+	return {
+		bytes: rasterizedBytes,
+		imageOnly: true,
+	};
+}
+
 function scaleAndTranslateAnnotationArray(
 	array: PDFArray,
 	scale: number,
@@ -293,75 +510,97 @@ function scaleAndTranslatePageAnnotations(
 	dx: number,
 	dy: number,
 ) {
-	const annots = page.node.lookupMaybe(PDFName.of("Annots"), PDFArray);
-	if (!annots) return;
+	try {
+		const annots = page.node.lookupMaybe(PDFName.of("Annots"), PDFArray);
+		if (!annots) return;
 
-	for (let i = 0; i < annots.size(); i++) {
-		const annotRef = annots.get(i);
-		const annotDict = page.doc.context.lookup(annotRef);
-		if (!annotDict || typeof (annotDict as any).lookupMaybe !== "function") {
-			continue;
-		}
+		for (let i = 0; i < annots.size(); i++) {
+			try {
+				const annotRef = annots.get(i);
+				const annotDict = page.doc.context.lookup(annotRef);
+				if (!annotDict || typeof (annotDict as any).lookupMaybe !== "function") {
+					continue;
+				}
 
-		const rect = (annotDict as any).lookupMaybe(PDFName.of("Rect"), PDFArray);
-		if (rect instanceof PDFArray) {
-			scaleAndTranslateAnnotationArray(rect, scale, dx, dy);
-		}
+				const rect = (annotDict as any).lookupMaybe(PDFName.of("Rect"), PDFArray);
+				if (rect instanceof PDFArray) {
+					scaleAndTranslateAnnotationArray(rect, scale, dx, dy);
+				}
 
-		const quadPoints = (annotDict as any).lookupMaybe(
-			PDFName.of("QuadPoints"),
-			PDFArray,
-		);
-		if (quadPoints instanceof PDFArray) {
-			scaleAndTranslateAnnotationArray(quadPoints, scale, dx, dy);
+				const quadPoints = (annotDict as any).lookupMaybe(
+					PDFName.of("QuadPoints"),
+					PDFArray,
+				);
+				if (quadPoints instanceof PDFArray) {
+					scaleAndTranslateAnnotationArray(quadPoints, scale, dx, dy);
+				}
+			} catch {
+				// Ignore malformed annotation references.
+			}
 		}
+	} catch {
+		// Ignore malformed annotation collections.
 	}
 }
 
 function getIssuesFromDoc(doc: PDFDocument): PageIssue[] {
-	const pages = doc.getPages();
 	const [A4_WIDTH, A4_HEIGHT] = PageSizes.A4;
 	const issues: PageIssue[] = [];
+	let pageCount = 0;
+	try {
+		pageCount = doc.getPageCount();
+	} catch {
+		return issues;
+	}
 
-	pages.forEach((page, index) => {
-		const { width, height } = page.getSize();
-		const rotation = page.getRotation();
+	for (let index = 0; index < pageCount; index++) {
+		try {
+			const page = doc.getPage(index);
+			const { width, height } = page.getSize();
+			const rotation = page.getRotation();
 
-		const isPortrait = height >= width;
-		const isPortraitRotation = rotation.angle % 180 === 0;
-		const isA4Dimensions =
-			Math.abs(width - A4_WIDTH) <= 5 && Math.abs(height - A4_HEIGHT) <= 5;
+			const isPortrait = height >= width;
+			const isPortraitRotation = rotation.angle % 180 === 0;
+			const isA4Dimensions =
+				Math.abs(width - A4_WIDTH) <= 5 && Math.abs(height - A4_HEIGHT) <= 5;
 
-		if (!isPortrait || !isA4Dimensions || !isPortraitRotation) {
-			let type: "size" | "orientation" | "both" = "size";
-			const parts = [];
+			if (!isPortrait || !isA4Dimensions || !isPortraitRotation) {
+				let type: "size" | "orientation" | "both" = "size";
+				const parts = [];
 
-			if (!isPortrait) {
-				parts.push("Landscape Page Box");
-				type = "orientation";
+				if (!isPortrait) {
+					parts.push("Landscape Page Box");
+					type = "orientation";
+				}
+				if (!isA4Dimensions) {
+					parts.push("Non-A4 Size");
+					type = "size";
+				}
+				if (!isPortraitRotation) {
+					parts.push("Sideways Page Rotation");
+					type = "orientation";
+				}
+				if (
+					(!isPortrait || !isPortraitRotation) &&
+					!isA4Dimensions
+				) {
+					type = "both";
+				}
+
+				issues.push({
+					pageIndex: index,
+					issueType: type,
+					description: parts.join(", "),
+				});
 			}
-			if (!isA4Dimensions) {
-				parts.push("Non-A4 Size");
-				type = "size";
-			}
-			if (!isPortraitRotation) {
-				parts.push("Sideways Page Rotation");
-				type = "orientation";
-			}
-			if (
-				(!isPortrait || !isPortraitRotation) &&
-				!isA4Dimensions
-			) {
-				type = "both";
-			}
-
+		} catch {
 			issues.push({
 				pageIndex: index,
-				issueType: type,
-				description: parts.join(", "),
+				issueType: "both",
+				description: "Malformed page object",
 			});
 		}
-	});
+	}
 
 	return issues;
 }
@@ -370,14 +609,23 @@ async function getScaledPageHeightsForRender(
 	pdfBytes: Uint8Array,
 	targetWidth: number,
 ): Promise<number[]> {
-	const doc = await PDFDocument.load(pdfBytes, { updateMetadata: false });
-	return doc.getPages().map((page) => {
-		const { width, height } = page.getSize();
-		const rotation = normalizeAngle(page.getRotation().angle);
-		const effectiveWidth = rotation % 180 === 0 ? width : height;
-		const effectiveHeight = rotation % 180 === 0 ? height : width;
-		return (targetWidth * effectiveHeight) / effectiveWidth;
-	});
+	const doc = await loadPdfForEditing(pdfBytes);
+	const heights: number[] = [];
+	const fallbackHeight = targetWidth * Math.sqrt(2);
+	const pageCount = doc.getPageCount();
+	for (let i = 0; i < pageCount; i++) {
+		try {
+			const page = doc.getPage(i);
+			const { width, height } = page.getSize();
+			const rotation = normalizeAngle(page.getRotation().angle);
+			const effectiveWidth = rotation % 180 === 0 ? width : height;
+			const effectiveHeight = rotation % 180 === 0 ? height : width;
+			heights.push((targetWidth * effectiveHeight) / effectiveWidth);
+		} catch {
+			heights.push(fallbackHeight);
+		}
+	}
+	return heights;
 }
 
 function getBeforePreviewDisplayRotation(
@@ -484,9 +732,7 @@ function PageEditorModal({
 
 		void (async () => {
 			const textAngles = await detectDominantTextAngles(originalFileBytes);
-			const doc = await PDFDocument.load(originalFileBytes, {
-				updateMetadata: false,
-			});
+			const doc = await loadPdfForEditing(originalFileBytes);
 			const pages = doc.getPages();
 			const rotations = pages.map((page, index) => {
 				const { width, height } = page.getSize();
@@ -911,6 +1157,12 @@ function PageEditorModal({
 						<X className="w-5 h-5" />
 					</button>
 				</div>
+				{file.imageOnly && (
+					<div className="px-4 py-2 border-b border-rose-200 bg-rose-50 text-xs text-rose-700 flex items-center gap-2">
+						<AlertTriangle className="w-4 h-4 flex-shrink-0" />
+						<span>{IMAGE_ONLY_NOTICE}</span>
+					</div>
+				)}
 
 				<div className="flex-1 flex overflow-hidden">
 					{/* Sidebar with issues */}
@@ -1150,6 +1402,7 @@ function SortableItem({
 		transform: CSS.Transform.toString(transform),
 		transition,
 	};
+	const isProcessing = Boolean(file.processingStage);
 
 	return (
 		<div
@@ -1162,22 +1415,34 @@ function SortableItem({
 					: "border-slate-200 hover:border-slate-300",
 			)}
 		>
-			<button
-				{...attributes}
-				{...listeners}
-				className="p-1 text-slate-400 hover:text-slate-600 cursor-grab active:cursor-grabbing rounded-md hover:bg-slate-100 transition-colors touch-none"
-			>
-				<GripVertical className="w-5 h-5" />
-			</button>
+				<button
+					{...attributes}
+					{...listeners}
+					disabled={isProcessing}
+					className={cn(
+						"p-1 rounded-md transition-colors touch-none",
+						isProcessing
+							? "text-slate-300 cursor-not-allowed"
+							: "text-slate-400 hover:text-slate-600 cursor-grab active:cursor-grabbing hover:bg-slate-100",
+					)}
+				>
+					<GripVertical className="w-5 h-5" />
+				</button>
 			<FileText className="w-5 h-5 text-indigo-500 flex-shrink-0" />
 			<div className="flex-1 min-w-0">
 				<div className="flex items-center gap-2">
-					<span className="truncate font-medium text-slate-700">
-						{file.name}
-					</span>
-					<div className="flex items-center gap-2 flex-wrap mt-1.5">
-						{file.issues && file.issues.length > 0 && (
-							<span className="flex items-center gap-1 text-xs font-medium text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">
+						<span className="truncate font-medium text-slate-700">
+							{file.name}
+						</span>
+						<div className="flex items-center gap-2 flex-wrap mt-1.5">
+							{file.processingStage && (
+								<span className="flex items-center gap-1 text-xs font-medium text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-full border border-indigo-200">
+									<Loader2 className="w-3 h-3 animate-spin" />
+									{getProcessingStageLabel(file.processingStage)}
+								</span>
+							)}
+							{file.issues && file.issues.length > 0 && (
+								<span className="flex items-center gap-1 text-xs font-medium text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">
 								<AlertTriangle className="w-3 h-3" />
 								{file.issues.length} Issue
 								{file.issues.length > 1 ? "s" : ""}
@@ -1189,33 +1454,48 @@ function SortableItem({
 								Auto-Fixed
 							</span>
 						)}
+							{file.imageOnly && (
+								<ImageOnlyBadge />
+							)}
 					</div>
 				</div>
 			</div>
 
-			{(file.issues && file.issues.length > 0) || file.autoFixApplied ? (
-				<button
-					onClick={() => onEdit(file)}
-					className="px-3 py-1.5 text-xs font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors flex items-center gap-1"
+				{!isProcessing && ((file.issues && file.issues.length > 0) || file.autoFixApplied) ? (
+					<button
+						onClick={() => onEdit(file)}
+						className="px-3 py-1.5 text-xs font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors flex items-center gap-1"
 				>
 					Review & Amend
 				</button>
 			) : null}
 
-			<button
-				onClick={() => onPreview(file)}
-				className="p-2 text-slate-400 hover:text-indigo-500 hover:bg-indigo-50 rounded-lg transition-colors"
-				title="Preview file"
-			>
-				<Eye className="w-4 h-4" />
-			</button>
-			<button
-				onClick={() => onRemove(file.id)}
-				className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
-				title="Remove file"
-			>
-				<Trash2 className="w-4 h-4" />
-			</button>
+				<button
+					onClick={() => onPreview(file)}
+					disabled={isProcessing}
+					className={cn(
+						"p-2 rounded-lg transition-colors",
+						isProcessing
+							? "text-slate-300 cursor-not-allowed"
+							: "text-slate-400 hover:text-indigo-500 hover:bg-indigo-50",
+					)}
+					title="Preview file"
+				>
+					<Eye className="w-4 h-4" />
+				</button>
+				<button
+					onClick={() => onRemove(file.id)}
+					disabled={isProcessing}
+					className={cn(
+						"p-2 rounded-lg transition-colors",
+						isProcessing
+							? "text-slate-300 cursor-not-allowed"
+							: "text-slate-400 hover:text-red-500 hover:bg-red-50",
+					)}
+					title="Remove file"
+				>
+					<Trash2 className="w-4 h-4" />
+				</button>
 		</div>
 	);
 }
@@ -1308,6 +1588,7 @@ function BundleOfAuthoritiesPage() {
 	const [individualFiles, setIndividualFiles] = useState<PdfFile[]>([]);
 	const bytesStoreRef = useRef<Map<string, Uint8Array>>(new Map());
 	const originalBytesStoreRef = useRef<Map<string, Uint8Array>>(new Map());
+	const coverUploadRequestIdRef = useRef(0);
 	const [isGenerating, setIsGenerating] = useState(false);
 	const [generatedPdfUrl, setGeneratedPdfUrl] = useState<string | null>(null);
 	const [tabInfo, setTabInfo] = useState<TabInfo[]>([]);
@@ -1339,6 +1620,8 @@ function BundleOfAuthoritiesPage() {
 	const [editingOriginalBytes, setEditingOriginalBytes] =
 		useState<Uint8Array | null>(null);
 	const editRequestIdRef = useRef(0);
+	const hasPendingUploads = Boolean(coverFile?.processingStage) ||
+		individualFiles.some((file) => Boolean(file.processingStage));
 
 	const autoFixPdf = async (
 		pdfBytes: Uint8Array,
@@ -1350,11 +1633,37 @@ function BundleOfAuthoritiesPage() {
 		autoFixSummary?: string;
 		autoFixedPageFixTypes: Record<number, ("rotation" | "scaling")[]>;
 	}> => {
+		const buildRasterizedFallbackResult = async () => {
+			const rasterizedBytes = await rasterizePdfToEditableA4(pdfBytes);
+			const rasterizedDoc = await loadPdfForEditing(rasterizedBytes);
+			const pageCount = rasterizedDoc.getPageCount();
+			const autoFixedPageFixTypes = Object.fromEntries(
+				Array.from({ length: pageCount }, (_, pageIndex) => [
+					pageIndex,
+					["scaling"] as ("rotation" | "scaling")[],
+				]),
+			);
+			return {
+				bytes: rasterizedBytes,
+				issues: getIssuesFromDoc(rasterizedDoc),
+				pageCount,
+				autoFixApplied: true,
+				autoFixSummary: `${pageCount}/${pageCount} pages rasterized and normalized to A4 to bypass PDF protection. ${IMAGE_ONLY_NOTICE}`,
+				autoFixedPageFixTypes,
+			};
+		};
+
 		try {
-			const srcDoc = await PDFDocument.load(pdfBytes, { updateMetadata: false });
-			const textAngles = await detectDominantTextAngles(pdfBytes);
+			const srcDoc = await loadPdfForEditing(pdfBytes);
 			const [A4_WIDTH, A4_HEIGHT] = PageSizes.A4;
 			const pageCount = srcDoc.getPageCount();
+			let malformedPageEncountered = false;
+			let textAngles: (number | null)[] = [];
+			try {
+				textAngles = await detectDominantTextAngles(pdfBytes);
+			} catch {
+				textAngles = Array.from({ length: pageCount }, () => null);
+			}
 			const autoFixedPageFixes = new Map<
 				number,
 				{ rotation: boolean; scaling: boolean }
@@ -1373,44 +1682,48 @@ function BundleOfAuthoritiesPage() {
 			let rotatedPages = 0;
 
 			for (let i = 0; i < pageCount; i++) {
-				const page = srcDoc.getPage(i);
-				const { width, height } = page.getSize();
-				const currentRotation = normalizeAngle(page.getRotation().angle);
-				const detectedTextAngle = textAngles[i] ?? null;
-				const nextRotation = chooseFinalPageRotationForPortrait(
-					currentRotation,
-					detectedTextAngle,
-				);
-				page.setRotation(degrees(nextRotation));
-				if (nextRotation !== currentRotation) rotatedPages++;
+				try {
+					const page = srcDoc.getPage(i);
+					const { width, height } = page.getSize();
+					const currentRotation = normalizeAngle(page.getRotation().angle);
+					const detectedTextAngle = textAngles[i] ?? null;
+					const nextRotation = chooseFinalPageRotationForPortrait(
+						currentRotation,
+						detectedTextAngle,
+					);
+					page.setRotation(degrees(nextRotation));
+					if (nextRotation !== currentRotation) rotatedPages++;
 
-				const targetW = A4_WIDTH;
-				const targetH = A4_HEIGHT;
-				const scale = Math.min(targetW / width, targetH / height);
-				const scaledWidth = width * scale;
-				const scaledHeight = height * scale;
-				const dx = (targetW - scaledWidth) / 2;
-				const dy = (targetH - scaledHeight) / 2;
+					const targetW = A4_WIDTH;
+					const targetH = A4_HEIGHT;
+					const scale = Math.min(targetW / width, targetH / height);
+					const scaledWidth = width * scale;
+					const scaledHeight = height * scale;
+					const dx = (targetW - scaledWidth) / 2;
+					const dy = (targetH - scaledHeight) / 2;
 
-				page.setSize(targetW, targetH);
-				page.scaleContent(scale, scale);
-				page.translateContent(dx, dy);
-				scaleAndTranslatePageAnnotations(page, scale, dx, dy);
+					page.setSize(targetW, targetH);
+					page.scaleContent(scale, scale);
+					page.translateContent(dx, dy);
+					scaleAndTranslatePageAnnotations(page, scale, dx, dy);
 
-				if (
-					nextRotation !== currentRotation ||
-					Math.abs(width - targetW) > 0.5 ||
-					Math.abs(height - targetH) > 0.5
-				) {
-					if (nextRotation !== currentRotation) {
-						markFix(i, "rotation");
-					}
 					if (
+						nextRotation !== currentRotation ||
 						Math.abs(width - targetW) > 0.5 ||
 						Math.abs(height - targetH) > 0.5
 					) {
-						markFix(i, "scaling");
+						if (nextRotation !== currentRotation) {
+							markFix(i, "rotation");
+						}
+						if (
+							Math.abs(width - targetW) > 0.5 ||
+							Math.abs(height - targetH) > 0.5
+						) {
+							markFix(i, "scaling");
+						}
 					}
+				} catch {
+					malformedPageEncountered = true;
 				}
 			}
 
@@ -1419,47 +1732,60 @@ function BundleOfAuthoritiesPage() {
 				objectsPerTick: 100,
 			});
 
-			const finalAngles = await detectDominantTextAngles(firstPassBytes);
-			const firstPassDoc = await PDFDocument.load(firstPassBytes, {
-				updateMetadata: false,
-			});
-			const firstPassRotations = firstPassDoc
-				.getPages()
-				.map((page) => normalizeAngle(page.getRotation().angle));
-			const upsideDownPages: number[] = [];
-			for (let i = 0; i < finalAngles.length; i++) {
-				if (
-					getUpsideDownCorrectionFromAngle(
-						finalAngles[i],
-						firstPassRotations[i] ?? 0,
-					) === 180
-				) {
-					upsideDownPages.push(i);
-				}
-			}
-
 			let finalBytes = firstPassBytes;
-			if (upsideDownPages.length > 0) {
-				const correctedDoc = await PDFDocument.load(firstPassBytes, {
-					updateMetadata: false,
-				});
-				for (const pageIndex of upsideDownPages) {
-					const page = correctedDoc.getPage(pageIndex);
-					const rotation = normalizeAngle(page.getRotation().angle);
-					page.setRotation(degrees(rotation + 180));
-					markFix(pageIndex, "rotation");
+			try {
+				const finalAngles = await detectDominantTextAngles(firstPassBytes);
+				const firstPassDoc = await loadPdfForEditing(firstPassBytes);
+				const firstPassPageCount = firstPassDoc.getPageCount();
+				const upsideDownPages: number[] = [];
+				for (let i = 0; i < Math.min(finalAngles.length, firstPassPageCount); i++) {
+					try {
+						const page = firstPassDoc.getPage(i);
+						const rotation = normalizeAngle(page.getRotation().angle);
+						if (
+							getUpsideDownCorrectionFromAngle(finalAngles[i] ?? null, rotation) === 180
+						) {
+							upsideDownPages.push(i);
+						}
+						} catch {
+							malformedPageEncountered = true;
+						}
+					}
+
+					if (upsideDownPages.length > 0) {
+						const correctedDoc = await loadPdfForEditing(firstPassBytes);
+					for (const pageIndex of upsideDownPages) {
+						try {
+							const page = correctedDoc.getPage(pageIndex);
+							const rotation = normalizeAngle(page.getRotation().angle);
+							page.setRotation(degrees(rotation + 180));
+								markFix(pageIndex, "rotation");
+								rotatedPages++;
+							} catch {
+								malformedPageEncountered = true;
+							}
+						}
+						finalBytes = await correctedDoc.save({
+							useObjectStreams: true,
+							objectsPerTick: 100,
+						});
+					}
+				} catch {
+					malformedPageEncountered = true;
 				}
-				finalBytes = await correctedDoc.save({
-					useObjectStreams: true,
-					objectsPerTick: 100,
-				});
-				rotatedPages += upsideDownPages.length;
+
+			let remainingIssues: PageIssue[] = [];
+			try {
+				const finalDocForIssues = await loadPdfForEditing(finalBytes);
+				remainingIssues = getIssuesFromDoc(finalDocForIssues);
+			} catch {
+				remainingIssues = getIssuesFromDoc(srcDoc);
+				malformedPageEncountered = true;
+			}
+			if (malformedPageEncountered) {
+				throw new Error("Malformed page references detected");
 			}
 
-			const finalDocForIssues = await PDFDocument.load(finalBytes, {
-				updateMetadata: false,
-			});
-			const remainingIssues = getIssuesFromDoc(finalDocForIssues);
 			const changedPages = autoFixedPageFixes.size;
 			const autoFixApplied = changedPages > 0;
 			const autoFixSummary = autoFixApplied
@@ -1484,51 +1810,91 @@ function BundleOfAuthoritiesPage() {
 				autoFixedPageFixTypes,
 			};
 		} catch (error) {
-			console.error("Error auto-fixing PDF:", error);
-			// Fallback: return original bytes and issues if it fails
-			const srcDocFallback = await PDFDocument.load(pdfBytes, { updateMetadata: false });
-			return {
-				bytes: pdfBytes,
-				issues: getIssuesFromDoc(srcDocFallback),
-				pageCount: srcDocFallback.getPageCount(),
-				autoFixApplied: false,
-				autoFixedPageFixTypes: {},
-			};
+			console.error("Structured auto-fix failed, retrying with rasterization:", error);
+			try {
+				return await buildRasterizedFallbackResult();
+			} catch (rasterError) {
+				console.error("Raster fallback failed:", rasterError);
+				throw new Error(
+					"Unable to auto-fix this PDF. The file is unreadable even after rasterization.",
+				);
+			}
 		}
 	};
 
 	const processCoverFile = async (file: File) => {
 		if (file.type === "application/pdf") {
-			const arrayBuffer = await file.arrayBuffer();
-			const originalBytes = new Uint8Array(arrayBuffer);
-			const {
-				bytes: finalBytes,
-				issues,
-				pageCount,
-				autoFixApplied,
-				autoFixSummary,
-				autoFixedPageFixTypes,
-			} =
-				await autoFixPdf(originalBytes);
-			const id = crypto.randomUUID();
-
+			const requestId = ++coverUploadRequestIdRef.current;
+			const coverId = crypto.randomUUID();
 			if (coverFile) {
 				bytesStoreRef.current.delete(coverFile.id);
 				originalBytesStoreRef.current.delete(coverFile.id);
 			}
-
-			bytesStoreRef.current.set(id, finalBytes);
-			originalBytesStoreRef.current.set(id, originalBytes);
 			setCoverFile({
-				id,
+				id: coverId,
 				name: file.name,
 				file,
-				pageCount,
-				issues: issues.length > 0 ? issues : undefined,
-				autoFixApplied,
-				autoFixSummary,
-				autoFixedPageFixTypes,
+				pageCount: 0,
+				processingStage: "uploading",
 			});
+
+			try {
+				const rawBytes = new Uint8Array(await file.arrayBuffer());
+				if (requestId !== coverUploadRequestIdRef.current) return;
+				setCoverFile((prev) =>
+					prev && prev.id === coverId
+						? { ...prev, processingStage: "scanning" }
+						: prev,
+				);
+				const prepared = await prepareEditablePdfBytes(rawBytes);
+				const editableBytes = prepared.bytes;
+				if (requestId !== coverUploadRequestIdRef.current) return;
+				setCoverFile((prev) =>
+					prev && prev.id === coverId
+						? {
+							...prev,
+							processingStage: "autofixing",
+							imageOnly: prepared.imageOnly,
+						}
+						: prev,
+				);
+				const {
+					bytes: finalBytes,
+					issues,
+					pageCount,
+					autoFixApplied,
+					autoFixSummary,
+					autoFixedPageFixTypes,
+				} = await autoFixPdf(editableBytes);
+				if (requestId !== coverUploadRequestIdRef.current) return;
+
+				bytesStoreRef.current.set(coverId, finalBytes);
+				originalBytesStoreRef.current.set(coverId, editableBytes);
+				setCoverFile({
+					id: coverId,
+					name: file.name,
+					file,
+					pageCount,
+					issues: issues.length > 0 ? issues : undefined,
+					autoFixApplied,
+					autoFixSummary: withImageOnlyNotice(
+						autoFixSummary,
+						prepared.imageOnly,
+					),
+					autoFixedPageFixTypes,
+					imageOnly: prepared.imageOnly,
+					processingStage: undefined,
+				});
+			} catch (error) {
+				if (requestId !== coverUploadRequestIdRef.current) return;
+				console.error("Failed to auto-fix cover PDF:", error);
+				setCoverFile(null);
+				alert(
+					error instanceof Error && error.message
+						? `Unable to auto-fix "${file.name}": ${error.message}`
+						: `Unable to auto-fix "${file.name}". The file may be severely corrupted or unsupported.`,
+				);
+			}
 		}
 	};
 
@@ -1562,11 +1928,41 @@ function BundleOfAuthoritiesPage() {
 
 	const processIndividualFiles = async (files: File[]) => {
 		const pdfFiles = files.filter((f) => f.type === "application/pdf");
+		if (pdfFiles.length === 0) return;
 
-		const newFiles: PdfFile[] = await Promise.all(
-			pdfFiles.map(async (file) => {
-				const arrayBuffer = await file.arrayBuffer();
-				const originalBytes = new Uint8Array(arrayBuffer);
+		const optimisticFiles: PdfFile[] = pdfFiles.map((file) => ({
+			id: crypto.randomUUID(),
+			name: file.name,
+			file,
+			pageCount: 0,
+			processingStage: "uploading",
+		}));
+		setIndividualFiles((prev) => [...prev, ...optimisticFiles]);
+
+		for (const optimisticFile of optimisticFiles) {
+			const { id, file } = optimisticFile;
+			try {
+				const rawBytes = new Uint8Array(await file.arrayBuffer());
+				setIndividualFiles((prev) =>
+					prev.map((existingFile) =>
+						existingFile.id === id
+							? { ...existingFile, processingStage: "scanning" }
+							: existingFile,
+					),
+				);
+				const prepared = await prepareEditablePdfBytes(rawBytes);
+				const editableBytes = prepared.bytes;
+				setIndividualFiles((prev) =>
+					prev.map((existingFile) =>
+						existingFile.id === id
+							? {
+								...existingFile,
+								processingStage: "autofixing",
+								imageOnly: prepared.imageOnly,
+							}
+							: existingFile,
+					),
+				);
 				const {
 					bytes: finalBytes,
 					issues,
@@ -1574,26 +1970,43 @@ function BundleOfAuthoritiesPage() {
 					autoFixApplied,
 					autoFixSummary,
 					autoFixedPageFixTypes,
-				} =
-					await autoFixPdf(originalBytes);
-				const id = crypto.randomUUID();
+				} = await autoFixPdf(editableBytes);
 
 				bytesStoreRef.current.set(id, finalBytes);
-				originalBytesStoreRef.current.set(id, originalBytes);
-				return {
-					id,
-					name: file.name,
-					file,
-					pageCount,
-					issues: issues.length > 0 ? issues : undefined,
-					autoFixApplied,
-					autoFixSummary,
-					autoFixedPageFixTypes,
-				};
-			}),
-		);
-
-		setIndividualFiles((prev) => [...prev, ...newFiles]);
+				originalBytesStoreRef.current.set(id, editableBytes);
+				setIndividualFiles((prev) =>
+					prev.map((existingFile) =>
+						existingFile.id === id
+							? {
+								...existingFile,
+								pageCount,
+								issues: issues.length > 0 ? issues : undefined,
+								autoFixApplied,
+								autoFixSummary: withImageOnlyNotice(
+									autoFixSummary,
+									prepared.imageOnly,
+								),
+								autoFixedPageFixTypes,
+								imageOnly: prepared.imageOnly,
+								processingStage: undefined,
+							}
+							: existingFile,
+					),
+				);
+			} catch (error) {
+				console.error(`Failed to auto-fix PDF ${file.name}:`, error);
+				bytesStoreRef.current.delete(id);
+				originalBytesStoreRef.current.delete(id);
+				setIndividualFiles((prev) =>
+					prev.filter((existingFile) => existingFile.id !== id),
+				);
+				alert(
+					error instanceof Error && error.message
+						? `Unable to auto-fix "${file.name}": ${error.message}`
+						: `Unable to auto-fix "${file.name}". The file may be severely corrupted or unsupported.`,
+				);
+			}
+		}
 	};
 
 	const handleIndividualFilesUpload = async (
@@ -1658,10 +2071,12 @@ function BundleOfAuthoritiesPage() {
 
 		void (async () => {
 			try {
-				const originalBytes = new Uint8Array(await file.file.arrayBuffer());
-				originalBytesStoreRef.current.set(file.id, originalBytes);
+				const rawBytes = new Uint8Array(await file.file.arrayBuffer());
+				const prepared = await prepareEditablePdfBytes(rawBytes);
+				const editableBytes = prepared.bytes;
+				originalBytesStoreRef.current.set(file.id, editableBytes);
 				if (requestId !== editRequestIdRef.current) return;
-				setEditingOriginalBytes(originalBytes);
+				setEditingOriginalBytes(editableBytes);
 			} catch (error) {
 				console.error("Failed to load original bytes for edit preview:", error);
 				const fallbackBytes = bytesStoreRef.current.get(file.id) ?? null;
@@ -1722,7 +2137,7 @@ function BundleOfAuthoritiesPage() {
 			if (coverFile) {
 				const coverBytes = bytesStoreRef.current.get(coverFile.id);
 				if (!coverBytes) throw new Error("Cover file bytes not found");
-				const coverDoc = await PDFDocument.load(coverBytes);
+				const coverDoc = await loadPdfForEditing(coverBytes);
 				const copiedPages = await mergedPdf.copyPages(
 					coverDoc,
 					coverDoc.getPageIndices(),
@@ -1764,7 +2179,7 @@ function BundleOfAuthoritiesPage() {
 				// Append individual file pages
 				const fileBytes = bytesStoreRef.current.get(file.id);
 				if (!fileBytes) throw new Error(`File bytes not found for ${file.name}`);
-				const fileDoc = await PDFDocument.load(fileBytes);
+				const fileDoc = await loadPdfForEditing(fileBytes);
 				const copiedPages = await mergedPdf.copyPages(
 					fileDoc,
 					fileDoc.getPageIndices(),
@@ -1875,18 +2290,28 @@ function BundleOfAuthoritiesPage() {
 																: ""}
 														</span>
 													)}
+												{coverFile.processingStage && (
+													<span className="flex items-center gap-1 text-xs font-medium text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-full border border-indigo-200">
+														<Loader2 className="w-3 h-3 animate-spin" />
+														{getProcessingStageLabel(coverFile.processingStage)}
+													</span>
+												)}
 												{coverFile.autoFixApplied && (
 													<span className="flex items-center gap-1 text-xs font-medium text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200" title={coverFile.autoFixSummary || "All pages were auto-fixed to A4 and portrait constraints."}>
 														<Check className="w-3 h-3" />
 														Auto-Fixed
 													</span>
 												)}
+												{coverFile.imageOnly && (
+													<ImageOnlyBadge />
+												)}
 											</div>
 
 											<div className="flex items-center gap-2">
 												{((coverFile.issues &&
 													coverFile.issues.length > 0) ||
-													coverFile.autoFixApplied) && (
+													coverFile.autoFixApplied) &&
+													!coverFile.processingStage && (
 														<button
 															type="button"
 															onClick={(e) => {
@@ -1914,7 +2339,13 @@ function BundleOfAuthoritiesPage() {
 												e.stopPropagation();
 												handlePreview(coverFile);
 											}}
-											className="mt-2 px-3 py-1.5 text-xs font-medium text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-md transition-colors flex items-center gap-1"
+											disabled={Boolean(coverFile.processingStage)}
+											className={cn(
+												"mt-2 px-3 py-1.5 text-xs font-medium rounded-md transition-colors flex items-center gap-1",
+												coverFile.processingStage
+													? "text-slate-400 bg-slate-100 cursor-not-allowed"
+													: "text-indigo-600 bg-indigo-50 hover:bg-indigo-100",
+											)}
 										>
 											<Eye className="w-3 h-3" /> Preview
 										</button>
@@ -1939,20 +2370,26 @@ function BundleOfAuthoritiesPage() {
 							/>
 						</label>
 						{coverFile && (
-							<div className="mt-3 flex justify-end">
-								<button
-									onClick={() => {
-										if (coverFile) {
-											bytesStoreRef.current.delete(coverFile.id);
-											originalBytesStoreRef.current.delete(coverFile.id);
-										}
-										setCoverFile(null);
-									}}
-									className="text-sm text-red-500 hover:text-red-700 font-medium flex items-center gap-1"
-								>
-									<Trash2 className="w-4 h-4" /> Remove
-								</button>
-							</div>
+								<div className="mt-3 flex justify-end">
+									<button
+										onClick={() => {
+											if (coverFile) {
+												bytesStoreRef.current.delete(coverFile.id);
+												originalBytesStoreRef.current.delete(coverFile.id);
+											}
+											setCoverFile(null);
+										}}
+										disabled={Boolean(coverFile.processingStage)}
+										className={cn(
+											"text-sm font-medium flex items-center gap-1",
+											coverFile.processingStage
+												? "text-slate-400 cursor-not-allowed"
+												: "text-red-500 hover:text-red-700",
+										)}
+									>
+										<Trash2 className="w-4 h-4" /> Remove
+									</button>
+								</div>
 						)}
 					</section>
 
@@ -2054,25 +2491,35 @@ function BundleOfAuthoritiesPage() {
 							add page numbers to the top right corner.
 						</p>
 
-						<button
-							onClick={generateSubmission}
-							disabled={
-								individualFiles.length === 0 || isGenerating
-							}
-							className="w-full py-3 px-4 bg-indigo-500 hover:bg-indigo-600 disabled:bg-slate-800 disabled:text-slate-500 text-white rounded-xl font-medium transition-colors flex items-center justify-center gap-2"
-						>
-							{isGenerating ? (
-								<>
-									<Loader2 className="w-5 h-5 animate-spin" />
-									Generating...
-								</>
-							) : (
-								<>
-									Generate Submission
-									<ArrowRight className="w-5 h-5" />
-								</>
+							<button
+								onClick={generateSubmission}
+								disabled={
+									individualFiles.length === 0 || isGenerating || hasPendingUploads
+								}
+								className="w-full py-3 px-4 bg-indigo-500 hover:bg-indigo-600 disabled:bg-slate-800 disabled:text-slate-500 text-white rounded-xl font-medium transition-colors flex items-center justify-center gap-2"
+							>
+								{isGenerating ? (
+									<>
+										<Loader2 className="w-5 h-5 animate-spin" />
+										Generating...
+									</>
+								) : hasPendingUploads ? (
+									<>
+										<Loader2 className="w-5 h-5 animate-spin" />
+										Processing uploads...
+									</>
+								) : (
+									<>
+										Generate Submission
+										<ArrowRight className="w-5 h-5" />
+									</>
+								)}
+							</button>
+							{hasPendingUploads && (
+								<p className="text-xs text-slate-400 mt-2">
+									Please wait until scanning and auto-fixing complete.
+								</p>
 							)}
-						</button>
 
 						{generatedPdfUrl && (
 							<div className="mt-6 pt-6 border-t border-slate-800">
@@ -2231,19 +2678,49 @@ function PdfPageFixerPage() {
 	const processFile = async (file: File) => {
 		if (file.type !== "application/pdf") return;
 
-		const bytes = new Uint8Array(await file.arrayBuffer());
-		const doc = await PDFDocument.load(bytes, { updateMetadata: false });
-		const issues = getIssuesFromDoc(doc);
+		const optimisticId = crypto.randomUUID();
+		setFileBytes(null);
+		setOriginalBytes(null);
+		setIsEditing(false);
 		setUploadedFile({
-			id: crypto.randomUUID(),
+			id: optimisticId,
 			name: file.name,
 			file,
-			pageCount: doc.getPageCount(),
-			issues: issues.length > 0 ? issues : undefined,
+			pageCount: 0,
+			processingStage: "uploading",
 		});
-		setFileBytes(bytes);
-		setOriginalBytes(bytes);
-		setIsEditing(false);
+
+		try {
+			const rawBytes = new Uint8Array(await file.arrayBuffer());
+			setUploadedFile((prev) =>
+				prev && prev.id === optimisticId
+					? { ...prev, processingStage: "scanning" }
+					: prev,
+			);
+			const prepared = await prepareEditablePdfBytes(rawBytes);
+			const editableBytes = prepared.bytes;
+			const doc = await loadPdfForEditing(editableBytes);
+			const issues = getIssuesFromDoc(doc);
+			setUploadedFile({
+				id: optimisticId,
+				name: file.name,
+				file,
+				pageCount: doc.getPageCount(),
+				issues: issues.length > 0 ? issues : undefined,
+				imageOnly: prepared.imageOnly,
+				processingStage: undefined,
+			});
+			setFileBytes(editableBytes);
+			setOriginalBytes(editableBytes);
+		} catch (error) {
+			console.error("Failed to process PDF:", error);
+			setUploadedFile(null);
+			alert(
+				error instanceof Error && error.message
+					? error.message
+					: "Unable to process this PDF.",
+			);
+		}
 	};
 
 	const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -2335,15 +2812,26 @@ function PdfPageFixerPage() {
 								<>
 									<FileText className="w-8 h-8 text-indigo-500 mb-2" />
 									<p className="text-sm font-medium text-slate-700">{uploadedFile.name}</p>
-									<p className="text-xs text-slate-500 mt-1">
-										{uploadedFile.pageCount} {uploadedFile.pageCount === 1 ? "page" : "pages"}
-									</p>
+									{uploadedFile.pageCount > 0 && (
+										<p className="text-xs text-slate-500 mt-1">
+											{uploadedFile.pageCount} {uploadedFile.pageCount === 1 ? "page" : "pages"}
+										</p>
+									)}
+									{uploadedFile.processingStage && (
+										<span className="mt-2 flex items-center gap-1 text-xs font-medium text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-full border border-indigo-200">
+											<Loader2 className="w-3 h-3 animate-spin" />
+											{getProcessingStageLabel(uploadedFile.processingStage)}
+										</span>
+									)}
 									{uploadedFile.issues && uploadedFile.issues.length > 0 && (
 										<span className="mt-2 flex items-center gap-1 text-xs font-medium text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">
 											<AlertTriangle className="w-3 h-3" />
 											{uploadedFile.issues.length} issue{uploadedFile.issues.length > 1 ? "s" : ""} detected
 										</span>
 									)}
+										{uploadedFile.imageOnly && (
+											<ImageOnlyBadge className="mt-2" />
+										)}
 									<p className="text-xs text-slate-500 mt-2">Click to replace</p>
 								</>
 							) : (

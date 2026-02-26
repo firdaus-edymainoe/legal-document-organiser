@@ -2252,26 +2252,26 @@ function BundleOfAuthoritiesPage() {
 							This will be placed at the very beginning. Pages are auto-fixed to A4 and portrait on upload.
 						</p>
 
-						<label
-							className={cn(
-								"flex flex-col items-center justify-center w-full h-32 border-2 border-dashed rounded-xl cursor-pointer transition-colors",
-								isCoverDragging
-									? "border-indigo-500 bg-indigo-100"
-									: coverFile
-										? "border-indigo-300 bg-indigo-50/50"
-										: "border-slate-300 bg-slate-50 hover:bg-slate-100 hover:border-slate-400",
+							<label
+								className={cn(
+									"flex flex-col items-center justify-center w-full h-44 border-2 border-dashed rounded-xl cursor-pointer transition-colors",
+									isCoverDragging
+										? "border-indigo-500 bg-indigo-100"
+										: coverFile
+											? "border-indigo-300 bg-indigo-50/50"
+											: "border-slate-300 bg-slate-50 hover:bg-slate-100 hover:border-slate-400",
 							)}
 							onDragOver={handleCoverDragOver}
 							onDragLeave={handleCoverDragLeave}
 							onDrop={handleCoverDrop}
 						>
-							<div className="flex flex-col items-center justify-center pt-5 pb-6">
-								{coverFile ? (
-									<>
-										<FileText className="w-8 h-8 text-indigo-500 mb-2" />
-										<p className="text-sm font-medium text-slate-700">
-											{coverFile.name}
-										</p>
+								<div className="flex flex-col items-center justify-center px-4 text-center">
+									{coverFile ? (
+										<>
+											<FileText className="w-8 h-8 text-indigo-500 mb-2" />
+											<p className="text-sm font-medium text-slate-700">
+												{coverFile.name}
+											</p>
 
 										<div className="flex flex-col items-center gap-2 mt-2 mb-1">
 											<div className="flex items-center gap-2 flex-wrap justify-center">
@@ -2307,52 +2307,15 @@ function BundleOfAuthoritiesPage() {
 												)}
 											</div>
 
-											<div className="flex items-center gap-2">
-												{((coverFile.issues &&
-													coverFile.issues.length > 0) ||
-													coverFile.autoFixApplied) &&
-													!coverFile.processingStage && (
-														<button
-															type="button"
-															onClick={(e) => {
-																e.preventDefault();
-																e.stopPropagation();
-																handleEdit(
-																	coverFile,
-																);
-															}}
-															className="px-3 py-1.5 text-xs font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors flex items-center gap-1"
-														>
-															Review & Amend
-														</button>
-													)}
 											</div>
-										</div>
 
-										<p className="text-xs text-slate-500 mt-1">
-											Click to replace
-										</p>
-										<button
-											type="button"
-											onClick={(e) => {
-												e.preventDefault();
-												e.stopPropagation();
-												handlePreview(coverFile);
-											}}
-											disabled={Boolean(coverFile.processingStage)}
-											className={cn(
-												"mt-2 px-3 py-1.5 text-xs font-medium rounded-md transition-colors flex items-center gap-1",
-												coverFile.processingStage
-													? "text-slate-400 bg-slate-100 cursor-not-allowed"
-													: "text-indigo-600 bg-indigo-50 hover:bg-indigo-100",
-											)}
-										>
-											<Eye className="w-3 h-3" /> Preview
-										</button>
-									</>
-								) : (
-									<>
-										<FileUp className={cn("w-8 h-8 mb-2", isCoverDragging ? "text-indigo-500" : "text-slate-400")} />
+											<p className="text-xs text-slate-500 mt-2">
+												Click to replace
+											</p>
+										</>
+									) : (
+										<>
+											<FileUp className={cn("w-8 h-8 mb-2", isCoverDragging ? "text-indigo-500" : "text-slate-400")} />
 										<p className={cn("text-sm font-medium", isCoverDragging ? "text-indigo-700" : "text-slate-700")}>
 											Click to upload or drag and drop PDF
 										</p>
@@ -2368,28 +2331,54 @@ function BundleOfAuthoritiesPage() {
 								accept="application/pdf"
 								onChange={handleCoverUpload}
 							/>
-						</label>
-						{coverFile && (
-								<div className="mt-3 flex justify-end">
-									<button
-										onClick={() => {
-											if (coverFile) {
-												bytesStoreRef.current.delete(coverFile.id);
+							</label>
+							{coverFile && (
+									<div className="mt-3 flex flex-wrap gap-3">
+										{((coverFile.issues &&
+											coverFile.issues.length > 0) ||
+											coverFile.autoFixApplied) &&
+											!coverFile.processingStage && (
+												<button
+													type="button"
+													onClick={() => handleEdit(coverFile)}
+													className="px-4 py-2 text-sm font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors"
+												>
+													Review & Amend
+												</button>
+											)}
+										<button
+											type="button"
+											onClick={() => handlePreview(coverFile)}
+											disabled={Boolean(coverFile.processingStage)}
+											className={cn(
+												"px-4 py-2 text-sm font-medium border rounded-lg transition-colors flex items-center gap-2",
+												coverFile.processingStage
+													? "text-slate-400 bg-slate-100 border-slate-200 cursor-not-allowed"
+													: "text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border-indigo-200",
+											)}
+										>
+											<Eye className="w-4 h-4" />
+											Preview
+										</button>
+										<button
+											onClick={() => {
+												if (coverFile) {
+													bytesStoreRef.current.delete(coverFile.id);
 												originalBytesStoreRef.current.delete(coverFile.id);
 											}
 											setCoverFile(null);
 										}}
-										disabled={Boolean(coverFile.processingStage)}
-										className={cn(
-											"text-sm font-medium flex items-center gap-1",
-											coverFile.processingStage
-												? "text-slate-400 cursor-not-allowed"
-												: "text-red-500 hover:text-red-700",
-										)}
-									>
-										<Trash2 className="w-4 h-4" /> Remove
-									</button>
-								</div>
+											disabled={Boolean(coverFile.processingStage)}
+											className={cn(
+												"px-4 py-2 text-sm font-medium border rounded-lg transition-colors flex items-center gap-2",
+												coverFile.processingStage
+													? "text-slate-400 bg-slate-100 border-slate-200 cursor-not-allowed"
+													: "text-red-600 bg-red-50 hover:bg-red-100 border-red-200",
+											)}
+										>
+											<Trash2 className="w-4 h-4" /> Remove
+										</button>
+									</div>
 						)}
 					</section>
 

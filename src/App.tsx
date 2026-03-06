@@ -1383,11 +1383,13 @@ function SortableItem({
 	onRemove,
 	onPreview,
 	onEdit,
+	onDownload,
 }: {
 	file: PdfFile;
 	onRemove: (id: string) => void;
 	onPreview: (file: PdfFile) => void;
 	onEdit: (file: PdfFile) => void;
+	onDownload?: (file: PdfFile) => void;
 }) {
 	const {
 		attributes,
@@ -1483,6 +1485,21 @@ function SortableItem({
 				>
 					<Eye className="w-4 h-4" />
 				</button>
+				{onDownload ? (
+					<button
+						onClick={() => onDownload(file)}
+						disabled={isProcessing}
+						className={cn(
+							"p-2 rounded-lg transition-colors",
+							isProcessing
+								? "text-slate-300 cursor-not-allowed"
+								: "text-slate-400 hover:text-indigo-500 hover:bg-indigo-50",
+						)}
+						title="Download file"
+					>
+						<Download className="w-4 h-4" />
+					</button>
+				) : null}
 				<button
 					onClick={() => onRemove(file.id)}
 					disabled={isProcessing}
@@ -2648,13 +2665,35 @@ function BundleOfAuthoritiesPage() {
 }
 
 function PdfPageFixerPage() {
-	const [uploadedFile, setUploadedFile] = useState<PdfFile | null>(null);
-	const [fileBytes, setFileBytes] = useState<Uint8Array | null>(null);
-	const [originalBytes, setOriginalBytes] = useState<Uint8Array | null>(null);
+	const [uploadedFiles, setUploadedFiles] = useState<PdfFile[]>([]);
+	const bytesStoreRef = useRef<Map<string, Uint8Array>>(new Map());
+	const originalBytesStoreRef = useRef<Map<string, Uint8Array>>(new Map());
 	const [isDragging, setIsDragging] = useState(false);
 	const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 	const [previewTitle, setPreviewTitle] = useState<string | null>(null);
-	const [isEditing, setIsEditing] = useState(false);
+	const [editingFile, setEditingFile] = useState<PdfFile | null>(null);
+	const [editingOriginalBytes, setEditingOriginalBytes] =
+		useState<Uint8Array | null>(null);
+	const editRequestIdRef = useRef(0);
+	const [isGenerating, setIsGenerating] = useState(false);
+	const hasPendingUploads = uploadedFiles.some((file) => Boolean(file.processingStage));
+
+	const sensors = useSensors(
+		useSensor(MouseSensor, {
+			activationConstraint: {
+				distance: 8,
+			},
+		}),
+		useSensor(TouchSensor, {
+			activationConstraint: {
+				delay: 200,
+				tolerance: 5,
+			},
+		}),
+		useSensor(KeyboardSensor, {
+			coordinateGetter: sortableKeyboardCoordinates,
+		}),
+	);
 
 	useEffect(() => {
 		return () => {
@@ -2664,98 +2703,415 @@ function PdfPageFixerPage() {
 		};
 	}, [previewUrl]);
 
-	const processFile = async (file: File) => {
-		if (file.type !== "application/pdf") return;
+	const autoFixPdf = async (
+		pdfBytes: Uint8Array,
+	): Promise<{
+		bytes: Uint8Array;
+		issues: PageIssue[];
+		pageCount: number;
+		autoFixApplied: boolean;
+		autoFixSummary?: string;
+		autoFixedPageFixTypes: Record<number, ("rotation" | "scaling")[]>;
+	}> => {
+		const buildRasterizedFallbackResult = async () => {
+			const rasterizedBytes = await rasterizePdfToEditableA4(pdfBytes);
+			const rasterizedDoc = await loadPdfForEditing(rasterizedBytes);
+			const pageCount = rasterizedDoc.getPageCount();
+			const autoFixedPageFixTypes = Object.fromEntries(
+				Array.from({ length: pageCount }, (_, pageIndex) => [
+					pageIndex,
+					["scaling"] as ("rotation" | "scaling")[],
+				]),
+			);
+			return {
+				bytes: rasterizedBytes,
+				issues: getIssuesFromDoc(rasterizedDoc),
+				pageCount,
+				autoFixApplied: true,
+				autoFixSummary: `${pageCount}/${pageCount} pages rasterized and normalized to A4 to bypass PDF protection. ${IMAGE_ONLY_NOTICE}`,
+				autoFixedPageFixTypes,
+			};
+		};
 
-		const optimisticId = crypto.randomUUID();
-		setFileBytes(null);
-		setOriginalBytes(null);
-		setIsEditing(false);
-		setUploadedFile({
-			id: optimisticId,
+		try {
+			const srcDoc = await loadPdfForEditing(pdfBytes);
+			const [A4_WIDTH, A4_HEIGHT] = PageSizes.A4;
+			const pageCount = srcDoc.getPageCount();
+			let malformedPageEncountered = false;
+			let textAngles: (number | null)[] = [];
+			try {
+				textAngles = await detectDominantTextAngles(pdfBytes);
+			} catch {
+				textAngles = Array.from({ length: pageCount }, () => null);
+			}
+			const autoFixedPageFixes = new Map<
+				number,
+				{ rotation: boolean; scaling: boolean }
+			>();
+			const markFix = (
+				pageIndex: number,
+				type: "rotation" | "scaling",
+			) => {
+				const existing = autoFixedPageFixes.get(pageIndex) ?? {
+					rotation: false,
+					scaling: false,
+				};
+				existing[type] = true;
+				autoFixedPageFixes.set(pageIndex, existing);
+			};
+			let rotatedPages = 0;
+
+			for (let i = 0; i < pageCount; i++) {
+				try {
+					const page = srcDoc.getPage(i);
+					const { width, height } = page.getSize();
+					const currentRotation = normalizeAngle(page.getRotation().angle);
+					const detectedTextAngle = textAngles[i] ?? null;
+					const nextRotation = chooseFinalPageRotationForPortrait(
+						currentRotation,
+						detectedTextAngle,
+					);
+					page.setRotation(degrees(nextRotation));
+					if (nextRotation !== currentRotation) rotatedPages++;
+
+					const targetW = A4_WIDTH;
+					const targetH = A4_HEIGHT;
+					const scale = Math.min(targetW / width, targetH / height);
+					const scaledWidth = width * scale;
+					const scaledHeight = height * scale;
+					const dx = (targetW - scaledWidth) / 2;
+					const dy = (targetH - scaledHeight) / 2;
+
+					page.setSize(targetW, targetH);
+					page.scaleContent(scale, scale);
+					page.translateContent(dx, dy);
+					scaleAndTranslatePageAnnotations(page, scale, dx, dy);
+
+					if (
+						nextRotation !== currentRotation ||
+						Math.abs(width - targetW) > 0.5 ||
+						Math.abs(height - targetH) > 0.5
+					) {
+						if (nextRotation !== currentRotation) {
+							markFix(i, "rotation");
+						}
+						if (
+							Math.abs(width - targetW) > 0.5 ||
+							Math.abs(height - targetH) > 0.5
+						) {
+							markFix(i, "scaling");
+						}
+					}
+				} catch {
+					malformedPageEncountered = true;
+				}
+			}
+
+			const firstPassBytes = await srcDoc.save({
+				useObjectStreams: true,
+				objectsPerTick: 100,
+			});
+
+			let finalBytes = firstPassBytes;
+			try {
+				const finalAngles = await detectDominantTextAngles(firstPassBytes);
+				const firstPassDoc = await loadPdfForEditing(firstPassBytes);
+				const firstPassPageCount = firstPassDoc.getPageCount();
+				const upsideDownPages: number[] = [];
+				for (let i = 0; i < Math.min(finalAngles.length, firstPassPageCount); i++) {
+					try {
+						const page = firstPassDoc.getPage(i);
+						const rotation = normalizeAngle(page.getRotation().angle);
+						if (
+							getUpsideDownCorrectionFromAngle(finalAngles[i] ?? null, rotation) === 180
+						) {
+							upsideDownPages.push(i);
+						}
+					} catch {
+						malformedPageEncountered = true;
+					}
+				}
+
+				if (upsideDownPages.length > 0) {
+					const correctedDoc = await loadPdfForEditing(firstPassBytes);
+					for (const pageIndex of upsideDownPages) {
+						try {
+							const page = correctedDoc.getPage(pageIndex);
+							const rotation = normalizeAngle(page.getRotation().angle);
+							page.setRotation(degrees(rotation + 180));
+							markFix(pageIndex, "rotation");
+							rotatedPages++;
+						} catch {
+							malformedPageEncountered = true;
+						}
+					}
+					finalBytes = await correctedDoc.save({
+						useObjectStreams: true,
+						objectsPerTick: 100,
+					});
+				}
+			} catch {
+				malformedPageEncountered = true;
+			}
+
+			let remainingIssues: PageIssue[] = [];
+			try {
+				const finalDocForIssues = await loadPdfForEditing(finalBytes);
+				remainingIssues = getIssuesFromDoc(finalDocForIssues);
+			} catch {
+				remainingIssues = getIssuesFromDoc(srcDoc);
+				malformedPageEncountered = true;
+			}
+			if (malformedPageEncountered) {
+				throw new Error("Malformed page references detected");
+			}
+
+			const changedPages = autoFixedPageFixes.size;
+			const autoFixApplied = changedPages > 0;
+			const autoFixSummary = autoFixApplied
+				? `${changedPages}/${pageCount} pages normalized to A4; ${rotatedPages} page(s) auto-rotated using text orientation detection.`
+				: undefined;
+			const autoFixedPageFixTypes = Object.fromEntries(
+				Array.from(autoFixedPageFixes.entries()).map(([pageIndex, fix]) => [
+					pageIndex,
+					[
+						...(fix.rotation ? (["rotation"] as const) : []),
+						...(fix.scaling ? (["scaling"] as const) : []),
+					],
+				]),
+			);
+
+			return {
+				bytes: finalBytes,
+				issues: remainingIssues,
+				pageCount,
+				autoFixApplied,
+				autoFixSummary,
+				autoFixedPageFixTypes,
+			};
+		} catch (error) {
+			console.error("Structured auto-fix failed, retrying with rasterization:", error);
+			try {
+				return await buildRasterizedFallbackResult();
+			} catch (rasterError) {
+				console.error("Raster fallback failed:", rasterError);
+				throw new Error(
+					"Unable to auto-fix this PDF. The file is unreadable even after rasterization.",
+				);
+			}
+		}
+	};
+
+	const processFiles = async (files: File[]) => {
+		const pdfFiles = files.filter((file) => file.type === "application/pdf");
+		if (pdfFiles.length === 0) return;
+
+		const optimisticFiles: PdfFile[] = pdfFiles.map((file) => ({
+			id: crypto.randomUUID(),
 			name: file.name,
 			file,
 			pageCount: 0,
 			processingStage: "uploading",
-		});
+		}));
+		setUploadedFiles((prev) => [...prev, ...optimisticFiles]);
 
-		try {
-			const rawBytes = new Uint8Array(await file.arrayBuffer());
-			setUploadedFile((prev) =>
-				prev && prev.id === optimisticId
-					? { ...prev, processingStage: "scanning" }
-					: prev,
-			);
-			const prepared = await prepareEditablePdfBytes(rawBytes);
-			const editableBytes = prepared.bytes;
-			const doc = await loadPdfForEditing(editableBytes);
-			const issues = getIssuesFromDoc(doc);
-			setUploadedFile({
-				id: optimisticId,
-				name: file.name,
-				file,
-				pageCount: doc.getPageCount(),
-				issues: issues.length > 0 ? issues : undefined,
-				imageOnly: prepared.imageOnly,
-				processingStage: undefined,
-			});
-			setFileBytes(editableBytes);
-			setOriginalBytes(editableBytes);
-		} catch (error) {
-			console.error("Failed to process PDF:", error);
-			setUploadedFile(null);
-			alert(
-				error instanceof Error && error.message
-					? error.message
-					: "Unable to process this PDF.",
-			);
+		for (const optimisticFile of optimisticFiles) {
+			const { id, file } = optimisticFile;
+			try {
+				const rawBytes = new Uint8Array(await file.arrayBuffer());
+				setUploadedFiles((prev) =>
+					prev.map((existingFile) =>
+						existingFile.id === id
+							? { ...existingFile, processingStage: "scanning" }
+							: existingFile,
+					),
+				);
+				const prepared = await prepareEditablePdfBytes(rawBytes);
+				const editableBytes = prepared.bytes;
+				setUploadedFiles((prev) =>
+					prev.map((existingFile) =>
+						existingFile.id === id
+							? {
+								...existingFile,
+								processingStage: "autofixing",
+								imageOnly: prepared.imageOnly,
+							}
+							: existingFile,
+					),
+				);
+				const {
+					bytes: finalBytes,
+					issues,
+					pageCount,
+					autoFixApplied,
+					autoFixSummary,
+					autoFixedPageFixTypes,
+				} = await autoFixPdf(editableBytes);
+
+				bytesStoreRef.current.set(id, finalBytes);
+				originalBytesStoreRef.current.set(id, editableBytes);
+				setUploadedFiles((prev) =>
+					prev.map((existingFile) =>
+						existingFile.id === id
+							? {
+								...existingFile,
+								pageCount,
+								issues: issues.length > 0 ? issues : undefined,
+								autoFixApplied,
+								autoFixSummary: withImageOnlyNotice(
+									autoFixSummary,
+									prepared.imageOnly,
+								),
+								autoFixedPageFixTypes,
+								imageOnly: prepared.imageOnly,
+								processingStage: undefined,
+							}
+							: existingFile,
+					),
+				);
+			} catch (error) {
+				console.error(`Failed to auto-fix PDF ${file.name}:`, error);
+				bytesStoreRef.current.delete(id);
+				originalBytesStoreRef.current.delete(id);
+				setUploadedFiles((prev) =>
+					prev.filter((existingFile) => existingFile.id !== id),
+				);
+				alert(
+					error instanceof Error && error.message
+						? `Unable to auto-fix "${file.name}": ${error.message}`
+						: `Unable to auto-fix "${file.name}". The file may be severely corrupted or unsupported.`,
+				);
+			}
 		}
 	};
 
 	const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-		const file = e.target.files?.[0];
-		if (!file) return;
-		await processFile(file);
+		const files = Array.from(e.target.files || []);
+		await processFiles(files);
+		e.target.value = "";
 	};
 
 	const handleDrop = async (e: React.DragEvent) => {
 		e.preventDefault();
 		setIsDragging(false);
-		const file = e.dataTransfer.files?.[0];
-		if (!file) return;
-		await processFile(file);
+		const files = Array.from(e.dataTransfer.files || []);
+		await processFiles(files as File[]);
 	};
 
-	const handlePreview = () => {
-		if (!uploadedFile || !fileBytes) return;
+	const handleDragEnd = (event: DragEndEvent) => {
+		const { active, over } = event;
+		if (over && active.id !== over.id) {
+			setUploadedFiles((items) => {
+				const oldIndex = items.findIndex((item) => item.id === active.id);
+				const newIndex = items.findIndex((item) => item.id === over.id);
+				return arrayMove(items, oldIndex, newIndex);
+			});
+		}
+	};
+
+	const handlePreview = (file: PdfFile) => {
+		const bytes = bytesStoreRef.current.get(file.id);
+		if (!bytes) return;
 		setPreviewUrl((current) => {
 			if (current) URL.revokeObjectURL(current);
-			return URL.createObjectURL(new Blob([fileBytes], { type: "application/pdf" }));
+			return URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
 		});
-		setPreviewTitle(uploadedFile.name);
+		setPreviewTitle(file.name);
 	};
 
-	const handleDownload = () => {
-		if (!uploadedFile || !fileBytes) return;
-		const url = URL.createObjectURL(new Blob([fileBytes], { type: "application/pdf" }));
+	const handleDownloadFile = (file: PdfFile) => {
+		const bytes = bytesStoreRef.current.get(file.id);
+		if (!bytes) return;
+		const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
 		const link = document.createElement("a");
 		link.href = url;
-		link.download = `${uploadedFile.name.replace(/\.pdf$/i, "")}_fixed.pdf`;
+		link.download = `${file.name.replace(/\.pdf$/i, "")}_fixed.pdf`;
 		document.body.appendChild(link);
 		link.click();
 		document.body.removeChild(link);
 		URL.revokeObjectURL(url);
 	};
 
+	const handleEdit = (file: PdfFile) => {
+		setEditingFile(file);
+		setEditingOriginalBytes(null);
+		const requestId = ++editRequestIdRef.current;
+
+		const existingOriginalBytes = originalBytesStoreRef.current.get(file.id);
+		if (existingOriginalBytes) {
+			setEditingOriginalBytes(existingOriginalBytes);
+			return;
+		}
+
+		void (async () => {
+			try {
+				const rawBytes = new Uint8Array(await file.file.arrayBuffer());
+				const prepared = await prepareEditablePdfBytes(rawBytes);
+				const editableBytes = prepared.bytes;
+				originalBytesStoreRef.current.set(file.id, editableBytes);
+				if (requestId !== editRequestIdRef.current) return;
+				setEditingOriginalBytes(editableBytes);
+			} catch (error) {
+				console.error("Failed to load original bytes for edit preview:", error);
+				const fallbackBytes = bytesStoreRef.current.get(file.id) ?? null;
+				if (requestId !== editRequestIdRef.current) return;
+				setEditingOriginalBytes(fallbackBytes);
+			}
+		})();
+	};
+
 	const handleSaveEdit = (updatedFile: PdfFile, newBytes: Uint8Array) => {
-		setUploadedFile((prev) =>
-			prev
-				? { ...updatedFile, file: prev.file }
-				: { ...updatedFile, file: updatedFile.file },
+		bytesStoreRef.current.set(updatedFile.id, newBytes);
+		setUploadedFiles((prev) =>
+			prev.map((file) => (file.id === updatedFile.id ? { ...updatedFile } : file)),
 		);
-		setFileBytes(newBytes);
-		setOriginalBytes(new Uint8Array(newBytes));
-		setIsEditing(false);
+		setEditingFile(null);
+		setEditingOriginalBytes(null);
+	};
+
+	const removeFile = (id: string) => {
+		bytesStoreRef.current.delete(id);
+		originalBytesStoreRef.current.delete(id);
+		setUploadedFiles((prev) => prev.filter((file) => file.id !== id));
+	};
+
+	const generateMergedPdf = async () => {
+		if (uploadedFiles.length === 0) return;
+		setIsGenerating(true);
+		try {
+			const mergedPdf = await PDFDocument.create();
+			for (const file of uploadedFiles) {
+				const fileBytes = bytesStoreRef.current.get(file.id);
+				if (!fileBytes) throw new Error(`File bytes not found for ${file.name}`);
+				const fileDoc = await loadPdfForEditing(fileBytes);
+				const copiedPages = await mergedPdf.copyPages(
+					fileDoc,
+					fileDoc.getPageIndices(),
+				);
+				copiedPages.forEach((page) => mergedPdf.addPage(page));
+			}
+
+			const mergedPdfBytes = await mergedPdf.save();
+			const url = URL.createObjectURL(
+				new Blob([mergedPdfBytes], { type: "application/pdf" }),
+			);
+			const link = document.createElement("a");
+			link.href = url;
+			link.download = "fixed_merged.pdf";
+			document.body.appendChild(link);
+			link.click();
+			document.body.removeChild(link);
+			URL.revokeObjectURL(url);
+		} catch (error) {
+			console.error("Failed to generate merged PDF:", error);
+			alert(
+				error instanceof Error && error.message
+					? `Unable to generate merged PDF: ${error.message}`
+					: "Unable to generate merged PDF.",
+			);
+		} finally {
+			setIsGenerating(false);
+		}
 	};
 
 	return (
@@ -2763,7 +3119,7 @@ function PdfPageFixerPage() {
 			<PageHeader
 				icon={<Wrench className="w-5 h-5 text-white" />}
 				title="PDF Page Fixer"
-				subtitle="Choose a PDF page and apply rotation/scaling fixes only"
+				subtitle="Auto-fix multiple PDFs and optionally merge them in your chosen order"
 				showBackButton
 				maxWidth="max-w-4xl"
 			/>
@@ -2771,20 +3127,18 @@ function PdfPageFixerPage() {
 			<main className="max-w-4xl mx-auto px-6 py-10">
 				<section className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6">
 					<div>
-						<h2 className="text-lg font-semibold">Upload PDF</h2>
+						<h2 className="text-lg font-semibold">Upload PDFs</h2>
 						<p className="text-slate-500 text-sm mt-1">
-							This tool only applies page rotation and A4 scaling fixes. It does not compile documents.
+							Each file is auto-fixed for unlock/normalization, portrait rotation, and A4 scaling. Drag to reorder for merged download.
 						</p>
 					</div>
 
 					<label
 						className={cn(
-							"flex flex-col items-center justify-center w-full h-44 border-2 border-dashed rounded-xl cursor-pointer transition-colors",
+							"flex flex-col items-center justify-center w-full h-36 border-2 border-dashed rounded-xl cursor-pointer transition-colors",
 							isDragging
 								? "border-indigo-500 bg-indigo-100"
-								: uploadedFile
-									? "border-indigo-300 bg-indigo-50/50"
-									: "border-slate-300 bg-slate-50 hover:bg-slate-100 hover:border-slate-400",
+								: "border-slate-300 bg-slate-50 hover:bg-slate-100 hover:border-slate-400",
 						)}
 						onDragOver={(e) => {
 							e.preventDefault();
@@ -2797,83 +3151,86 @@ function PdfPageFixerPage() {
 						onDrop={handleDrop}
 					>
 						<div className="flex flex-col items-center justify-center px-4 text-center">
-							{uploadedFile ? (
-								<>
-									<FileText className="w-8 h-8 text-indigo-500 mb-2" />
-									<p className="text-sm font-medium text-slate-700">{uploadedFile.name}</p>
-									{uploadedFile.pageCount > 0 && (
-										<p className="text-xs text-slate-500 mt-1">
-											{uploadedFile.pageCount} {uploadedFile.pageCount === 1 ? "page" : "pages"}
-										</p>
-									)}
-									{uploadedFile.processingStage && (
-										<span className="mt-2 flex items-center gap-1 text-xs font-medium text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-full border border-indigo-200">
-											<Loader2 className="w-3 h-3 animate-spin" />
-											{getProcessingStageLabel(uploadedFile.processingStage)}
-										</span>
-									)}
-									{uploadedFile.issues && uploadedFile.issues.length > 0 && (
-										<span className="mt-2 flex items-center gap-1 text-xs font-medium text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">
-											<AlertTriangle className="w-3 h-3" />
-											{uploadedFile.issues.length} issue{uploadedFile.issues.length > 1 ? "s" : ""} detected
-										</span>
-									)}
-										{uploadedFile.imageOnly && (
-											<ImageOnlyBadge className="mt-2" />
-										)}
-									<p className="text-xs text-slate-500 mt-2">Click to replace</p>
-								</>
-							) : (
-								<>
-									<FileUp className="w-8 h-8 text-slate-400 mb-2" />
-									<p className="text-sm font-medium text-slate-700">Click to upload or drag and drop PDF</p>
-									<p className="text-xs text-slate-500 mt-1">Single PDF file</p>
-								</>
-							)}
+							<FileUp className={cn("w-8 h-8 mb-2", isDragging ? "text-indigo-500" : "text-slate-400")} />
+							<p className={cn("text-sm font-medium", isDragging ? "text-indigo-700" : "text-slate-700")}>
+								Click to upload or drag and drop multiple PDFs
+							</p>
+							<p className="text-xs text-slate-500 mt-1">
+								You can select multiple files at once
+							</p>
 						</div>
 						<input
 							type="file"
 							className="hidden"
 							accept="application/pdf"
+							multiple
 							onChange={handleUpload}
 						/>
 					</label>
 
-					{uploadedFile && fileBytes && originalBytes ? (
-						<div className="flex flex-wrap gap-3">
-							<button
-								onClick={() => setIsEditing(true)}
-								className="px-4 py-2 text-sm font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg transition-colors"
+					{uploadedFiles.length > 0 ? (
+						<div className="space-y-3">
+							<DndContext
+								sensors={sensors}
+								collisionDetection={closestCenter}
+								onDragEnd={handleDragEnd}
 							>
-								Open Page Fixer
-							</button>
-							<button
-								onClick={handlePreview}
-								className="px-4 py-2 text-sm font-medium text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg transition-colors flex items-center gap-2"
-							>
-								<Eye className="w-4 h-4" />
-								Preview
-							</button>
-							<button
-								onClick={handleDownload}
-								className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors flex items-center gap-2"
-							>
-								<Download className="w-4 h-4" />
-								Download Fixed PDF
-							</button>
-							<button
-								onClick={() => {
-									setUploadedFile(null);
-									setFileBytes(null);
-									setOriginalBytes(null);
-								}}
-								className="px-4 py-2 text-sm font-medium text-red-600 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg transition-colors flex items-center gap-2"
-							>
-								<Trash2 className="w-4 h-4" />
-								Remove
-							</button>
+								<SortableContext
+									items={uploadedFiles.map((file) => file.id)}
+									strategy={verticalListSortingStrategy}
+								>
+									{uploadedFiles.map((file, index) => (
+										<div key={file.id} className="relative">
+											<div className="absolute -left-3 top-1/2 -translate-y-1/2 w-6 text-right text-xs font-bold text-slate-400">
+												{index + 1}
+											</div>
+											<SortableItem
+												file={file}
+												onRemove={removeFile}
+												onPreview={handlePreview}
+												onEdit={handleEdit}
+												onDownload={handleDownloadFile}
+											/>
+										</div>
+									))}
+								</SortableContext>
+							</DndContext>
 						</div>
-					) : null}
+					) : (
+						<div className="text-center py-8 text-slate-400 text-sm border border-dashed border-slate-200 rounded-xl">
+							No PDFs added yet.
+						</div>
+					)}
+
+					<div className="border-t border-slate-200 pt-6">
+						<button
+							onClick={generateMergedPdf}
+							disabled={uploadedFiles.length === 0 || isGenerating || hasPendingUploads}
+							className="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-200 disabled:text-slate-500 text-white rounded-xl font-medium transition-colors flex items-center justify-center gap-2"
+						>
+							{isGenerating ? (
+								<>
+									<Loader2 className="w-5 h-5 animate-spin" />
+									Generating merged PDF...
+								</>
+							) : hasPendingUploads ? (
+								<>
+									<Loader2 className="w-5 h-5 animate-spin" />
+									Processing uploads...
+								</>
+							) : (
+								<>
+									<Download className="w-5 h-5" />
+									Download Merged PDF
+								</>
+							)}
+						</button>
+						{hasPendingUploads ? (
+							<p className="text-xs text-slate-500 mt-2">
+								Please wait until scanning and auto-fixing complete.
+							</p>
+						) : null}
+					</div>
 				</section>
 			</main>
 
@@ -2889,12 +3246,17 @@ function PdfPageFixerPage() {
 				/>
 			)}
 
-			{isEditing && uploadedFile && fileBytes && originalBytes ? (
+			{editingFile &&
+			bytesStoreRef.current.get(editingFile.id) &&
+			editingOriginalBytes ? (
 				<PageEditorModal
-					file={uploadedFile}
-					fileBytes={fileBytes}
-					originalFileBytes={originalBytes}
-					onClose={() => setIsEditing(false)}
+					file={editingFile}
+					fileBytes={bytesStoreRef.current.get(editingFile.id)!}
+					originalFileBytes={editingOriginalBytes}
+					onClose={() => {
+						setEditingFile(null);
+						setEditingOriginalBytes(null);
+					}}
 					onSave={handleSaveEdit}
 				/>
 			) : null}
@@ -2933,7 +3295,7 @@ function LandingPage() {
 					</div>
 					<h2 className="text-lg font-semibold">PDF Page Fixer</h2>
 					<p className="text-sm text-slate-500 mt-2">
-						Open a single PDF and manually choose pages to rotate or fit to A4 with before/after review.
+						Auto-fix multiple PDFs, manually amend pages when needed, and optionally download one merged file.
 					</p>
 				</Link>
 			</main>

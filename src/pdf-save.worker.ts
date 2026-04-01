@@ -1,5 +1,7 @@
 import {
 	PDFDocument,
+	rgb,
+	StandardFonts,
 	PageSizes,
 	degrees,
 	PDFName,
@@ -20,6 +22,7 @@ export interface WorkerRequest {
 	fullDocumentPreview?: boolean; // when true, return all pages for scrolling preview
 	requestId?: number; // for preview - to ignore stale responses
 	useCachedBytes?: boolean; // use bytes from first transfer
+	addPageNumbers?: boolean; // whether to add page numbers to each page
 }
 
 function getIssuesFromDoc(doc: PDFDocument) {
@@ -136,6 +139,36 @@ function applyModifications(
 	}
 }
 
+async function addPageNumbersToDoc(doc: PDFDocument): Promise<void> {
+	const helveticaFont = await doc.embedFont(StandardFonts.Helvetica);
+	const pageCount = doc.getPageCount();
+
+	for (let i = 0; i < pageCount; i++) {
+		try {
+			const page = doc.getPage(i);
+			const { width, height } = page.getSize();
+			const pageNumber = i + 1;
+
+			const fontSize = 30;
+			const text = `${pageNumber}`;
+			const textWidth = helveticaFont.widthOfTextAtSize(text, fontSize);
+
+			const x = width - textWidth - 30;
+			const y = height - 30 - 10;
+
+			page.drawText(text, {
+				x,
+				y,
+				size: fontSize,
+				font: helveticaFont,
+				color: rgb(0, 0, 0),
+			});
+		} catch {
+			// Ignore malformed pages.
+		}
+	}
+}
+
 function scaleAndTranslateAnnotationArray(
 	array: PDFArray,
 	scale: number,
@@ -235,12 +268,18 @@ async function handlePreview(
 async function handleSave(
 	bytes: Uint8Array,
 	modifications: PageModification[],
+	addPageNumbers: boolean,
 ): Promise<{ bytes: Uint8Array; issues: ReturnType<typeof getIssuesFromDoc> }> {
 	const { bytes: editableBytes } = await normalizePdfForEditing(bytes);
 	const doc = await loadPdfForEditing(editableBytes);
 
 	// Apply all modifications directly to the existing pages — no copies needed
 	applyModifications(doc, modifications);
+
+	// Add page numbers if requested
+	if (addPageNumbers) {
+		await addPageNumbersToDoc(doc);
+	}
 
 	const issues = getIssuesFromDoc(doc);
 	const savedBytes = await doc.save({
@@ -293,7 +332,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 			// Release cached doc before heavy save to free memory
 			cachedDoc = null;
 			cachedBytes = null;
-			const result = await handleSave(bytes, modifications);
+			const result = await handleSave(bytes, modifications, e.data.addPageNumbers ?? false);
 			// Transfer buffer to avoid blocking main thread during structured clone
 			self.postMessage(
 				{ type: "save", ok: true, bytes: result.bytes, issues: result.issues },

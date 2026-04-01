@@ -1277,7 +1277,7 @@ function PageEditorModal({
 															: undefined
 													}
 												>
-													<div className="absolute top-2 right-2 bg-black/55 text-white text-xs px-2 py-1 rounded z-10 pointer-events-none">
+													<div className="absolute top-2 right-2 bg-black/55 text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity z-10 pointer-events-none">
 														Page {index + 1}
 													</div>
 													<Page
@@ -1334,7 +1334,7 @@ function PageEditorModal({
 															: undefined
 													}
 												>
-													<div className="absolute top-2 right-2 bg-black/55 text-white text-xs px-2 py-1 rounded z-10 pointer-events-none">
+													<div className="absolute top-2 right-2 bg-black/55 text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity z-10 pointer-events-none">
 														Page {index + 1}
 													</div>
 													<Page
@@ -1612,6 +1612,7 @@ function BundleOfAuthoritiesPage() {
 	const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 	const [previewTitle, setPreviewTitle] = useState<string | null>(null);
 	const [copied, setCopied] = useState(false);
+	const [addTabPages, setAddTabPages] = useState(true);
 
 	const [isCoverDragging, setIsCoverDragging] = useState(false);
 	const [isFilesDragging, setIsFilesDragging] = useState(false);
@@ -2170,28 +2171,30 @@ function BundleOfAuthoritiesPage() {
 				const tabNumber = i + 1;
 				const file = individualFiles[i];
 
-				// Add TAB-x page
-				const tabPage = mergedPdf.addPage([595.28, 841.89]); // A4 size
-				const { width, height } = tabPage.getSize();
-				const text = `TAB-${tabNumber}`;
-				const fontSize = 48;
-				const textWidth = font.widthOfTextAtSize(text, fontSize);
-				const textHeight = font.heightAtSize(fontSize);
-
-				tabPage.drawText(text, {
-					x: width / 2 - textWidth / 2,
-					y: height / 2 - textHeight / 4, // Adjust for baseline
-					size: fontSize,
-					font: font,
-					color: rgb(0, 0, 0),
-				});
-
 				newTabInfo.push({
 					tabNumber,
 					fileName: file.name,
 					pageNumber: currentPageNumber,
 				});
-				currentPageNumber++;
+
+				// Add TAB-x page
+				if (addTabPages) {
+					const tabPage = mergedPdf.addPage([595.28, 841.89]); // A4 size
+					const { width, height } = tabPage.getSize();
+					const text = `TAB-${tabNumber}`;
+					const fontSize = 48;
+					const textWidth = font.widthOfTextAtSize(text, fontSize);
+					const textHeight = font.heightAtSize(fontSize);
+
+					tabPage.drawText(text, {
+						x: width / 2 - textWidth / 2,
+						y: height / 2 - textHeight / 4, // Adjust for baseline
+						size: fontSize,
+						font: font,
+						color: rgb(0, 0, 0),
+					});
+					currentPageNumber++;
+				}
 
 				// Append individual file pages
 				const fileBytes = bytesStoreRef.current.get(file.id);
@@ -2492,10 +2495,32 @@ function BundleOfAuthoritiesPage() {
 						<h3 className="text-lg font-semibold mb-2">
 							Ready to compile?
 						</h3>
-						<p className="text-slate-400 text-sm mb-6">
-							This will merge all documents, insert TAB pages, and
-							add page numbers to the top right corner.
+						<p className="text-slate-400 text-sm mb-4">
+							This will merge all documents and add page numbers
+							to the top right corner.
 						</p>
+
+						<label className="flex items-center gap-3 cursor-pointer mb-6">
+							<div
+								className={cn(
+									"relative w-11 h-6 rounded-full transition-colors",
+									addTabPages ? "bg-indigo-500" : "bg-slate-600",
+								)}
+								onClick={() => setAddTabPages(!addTabPages)}
+							>
+								<div
+									className={cn(
+										"absolute top-1 w-4 h-4 bg-white rounded-full transition-transform",
+										addTabPages
+											? "translate-x-6"
+											: "translate-x-1",
+									)}
+								/>
+							</div>
+							<span className="text-sm font-medium">
+								Add TAB pages
+							</span>
+						</label>
 
 							<button
 								onClick={generateSubmission}
@@ -2676,6 +2701,8 @@ function PdfPageFixerPage() {
 		useState<Uint8Array | null>(null);
 	const editRequestIdRef = useRef(0);
 	const [isGenerating, setIsGenerating] = useState(false);
+	const [addPageNumbers, setAddPageNumbers] = useState(false);
+	const [pageNumberStart, setPageNumberStart] = useState(1);
 	const hasPendingUploads = uploadedFiles.some((file) => Boolean(file.processingStage));
 
 	const sensors = useSensors(
@@ -3091,6 +3118,27 @@ function PdfPageFixerPage() {
 				copiedPages.forEach((page) => mergedPdf.addPage(page));
 			}
 
+			if (addPageNumbers) {
+				const helveticaFont = await mergedPdf.embedFont(StandardFonts.Helvetica);
+				const pageCount = mergedPdf.getPageCount();
+				for (let i = 0; i < pageCount; i++) {
+					const page = mergedPdf.getPage(i);
+					const { width, height } = page.getSize();
+					const pageNumber = pageNumberStart + i;
+					const fontSize = 30;
+					const text = `${pageNumber}`;
+					const textWidth = helveticaFont.widthOfTextAtSize(text, fontSize);
+
+					page.drawText(text, {
+						x: width - textWidth - 30,
+						y: height - 30 - 10,
+						size: fontSize,
+						font: helveticaFont,
+						color: rgb(0, 0, 0),
+					});
+				}
+			}
+
 			const mergedPdfBytes = await mergedPdf.save();
 			const url = URL.createObjectURL(
 				new Blob([mergedPdfBytes], { type: "application/pdf" }),
@@ -3203,6 +3251,29 @@ function PdfPageFixerPage() {
 					)}
 
 					<div className="border-t border-slate-200 pt-6">
+						<button
+							onClick={() => setAddPageNumbers(!addPageNumbers)}
+							className={cn(
+								"w-full py-2 px-4 text-sm font-medium rounded-lg transition-colors border mb-3",
+								addPageNumbers
+									? "bg-indigo-50 text-indigo-700 border-indigo-200"
+									: "bg-white text-slate-600 border-slate-200 hover:bg-slate-50",
+							)}
+						>
+							{addPageNumbers ? "Page Numbers: ON (will be added to merged PDF)" : "Page Numbers: OFF (click to enable for merged PDF)"}
+						</button>
+						{addPageNumbers && (
+							<div className="flex items-center gap-3 mb-3">
+								<label className="text-sm text-slate-600">Start page number:</label>
+								<input
+									type="number"
+									min="0"
+									value={pageNumberStart}
+									onChange={(e) => setPageNumberStart(Math.max(0, parseInt(e.target.value) || 0))}
+									className="w-20 px-2 py-1 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+								/>
+							</div>
+						)}
 						<button
 							onClick={generateMergedPdf}
 							disabled={uploadedFiles.length === 0 || isGenerating || hasPendingUploads}

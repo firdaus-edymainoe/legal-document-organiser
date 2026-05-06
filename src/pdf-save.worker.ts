@@ -8,7 +8,11 @@ import {
 	PDFArray,
 	PDFNumber,
 } from "pdf-lib";
-import { loadPdfForEditing, normalizePdfForEditing } from "./lib/pdf-security";
+import {
+	loadPdfForEditing,
+	normalizePdfForEditing,
+	stripLogicalPageMetadata,
+} from "./lib/pdf-security";
 
 export type PageModification =
 	| { type: "rotate"; pageIndices: number[]; angle: number }
@@ -280,6 +284,8 @@ async function handleSave(
 	if (addPageNumbers) {
 		await addPageNumbersToDoc(doc);
 	}
+
+	stripLogicalPageMetadata(doc);
 
 	const issues = getIssuesFromDoc(doc);
 	const savedBytes = await doc.save({

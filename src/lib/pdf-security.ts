@@ -20,6 +20,13 @@ export async function loadPdfForEditing(bytes: Uint8Array): Promise<PDFDocument>
 	return PDFDocument.load(bytes, LOAD_OPTIONS);
 }
 
+export function stripLogicalPageMetadata(doc: PDFDocument): boolean {
+	const pageLabels = doc.catalog.lookupMaybe(PDFName.of("PageLabels"), PDFDict);
+	if (!pageLabels) return false;
+	doc.catalog.delete(PDFName.of("PageLabels"));
+	return true;
+}
+
 function hasSignatureField(field: PDFDict, visited: Set<PDFDict>): boolean {
 	if (visited.has(field)) return false;
 	visited.add(field);
@@ -103,6 +110,7 @@ async function copyPagesIntoFreshDocument(sourceDoc: PDFDocument): Promise<Uint8
 	for (const page of copiedPages) {
 		unlockedDoc.addPage(page);
 	}
+	stripLogicalPageMetadata(unlockedDoc);
 	return unlockedDoc.save(SAVE_OPTIONS);
 }
 
@@ -119,8 +127,18 @@ export async function normalizePdfForEditing(bytes: Uint8Array): Promise<{
 		return { bytes, bypassApplied: false, reasons: [] };
 	}
 	const reasons = getBypassReasons(sourceDoc);
+	const removedLogicalPageMetadata = stripLogicalPageMetadata(sourceDoc);
 	if (reasons.length === 0) {
-		return { bytes, bypassApplied: false, reasons };
+		if (!removedLogicalPageMetadata) {
+			return { bytes, bypassApplied: false, reasons };
+		}
+
+		try {
+			const sanitizedBytes = await sourceDoc.save(SAVE_OPTIONS);
+			return { bytes: sanitizedBytes, bypassApplied: false, reasons };
+		} catch {
+			return { bytes, bypassApplied: false, reasons };
+		}
 	}
 
 	try {

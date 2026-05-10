@@ -154,7 +154,14 @@ interface TabInfo {
 
 type PageModification =
 	| { type: "rotate"; pageIndices: number[]; angle: number }
-	| { type: "fitToA4"; pageIndices: number[] };
+	| { type: "fitToA4"; pageIndices: number[] }
+	| { type: "setPageColor"; pageIndices: number[]; color: PageColor };
+
+interface PageColor {
+	red: number;
+	green: number;
+	blue: number;
+}
 
 const RIGHT_ANGLES = [0, 90, 180, 270] as const;
 const TEXT_ORIENTATION_TOLERANCE_DEG = 20;
@@ -164,6 +171,17 @@ const IMAGE_ONLY_NOTICE =
 const PDF_POINTS_PER_INCH = 72;
 const RASTER_TARGET_DPI = 300;
 const RASTER_MAX_PIXELS = 20_000_000;
+const PAGE_COLOR_RECENTS_STORAGE_KEY = "pdf-page-fixer-recent-page-colors";
+const MAX_RECENT_PAGE_COLORS = 6;
+const DEFAULT_PAGE_COLOR_HEX = "#ffffff";
+const PRESET_PAGE_COLORS = [
+	"#ffffff",
+	"#fff7cc",
+	"#dff1ff",
+	"#e5f8df",
+	"#fde2ec",
+	"#f1f5f9",
+];
 
 interface EditablePdfPreparation {
 	bytes: Uint8Array;
@@ -289,6 +307,7 @@ function buildPageFixTypesFromModifications(
 ): Record<number, ("rotation" | "scaling")[]> {
 	const map = new Map<number, Set<"rotation" | "scaling">>();
 	for (const modification of modifications) {
+		if (modification.type === "setPageColor") continue;
 		const fixType = modification.type === "rotate" ? "rotation" : "scaling";
 		for (const pageIndex of modification.pageIndices) {
 			const existing = map.get(pageIndex) ?? new Set<"rotation" | "scaling">();
@@ -302,6 +321,57 @@ function buildPageFixTypesFromModifications(
 			Array.from(fixTypes),
 		]),
 	);
+}
+
+function normalizeHexColor(value: string): string | null {
+	const trimmed = value.trim();
+	const match = /^#?([0-9a-f]{6})$/i.exec(trimmed);
+	return match ? `#${match[1].toLowerCase()}` : null;
+}
+
+function hexToPageColor(hex: string): PageColor {
+	const normalized = normalizeHexColor(hex) ?? DEFAULT_PAGE_COLOR_HEX;
+	const red = parseInt(normalized.slice(1, 3), 16) / 255;
+	const green = parseInt(normalized.slice(3, 5), 16) / 255;
+	const blue = parseInt(normalized.slice(5, 7), 16) / 255;
+	return { red, green, blue };
+}
+
+function readRecentPageColors(): string[] {
+	try {
+		const raw = window.localStorage.getItem(PAGE_COLOR_RECENTS_STORAGE_KEY);
+		if (!raw) return [];
+		const parsed = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return [];
+		return parsed
+			.map((value) => (typeof value === "string" ? normalizeHexColor(value) : null))
+			.filter((value): value is string => Boolean(value))
+			.slice(0, MAX_RECENT_PAGE_COLORS);
+	} catch {
+		return [];
+	}
+}
+
+function writeRecentPageColors(colors: string[]) {
+	try {
+		window.localStorage.setItem(
+			PAGE_COLOR_RECENTS_STORAGE_KEY,
+			JSON.stringify(colors.slice(0, MAX_RECENT_PAGE_COLORS)),
+		);
+	} catch {
+		// Ignore unavailable storage.
+	}
+}
+
+function addRecentPageColor(colors: string[], color: string): string[] {
+	const normalized = normalizeHexColor(color);
+	if (!normalized) return colors;
+	const next = [
+		normalized,
+		...colors.filter((existing) => existing !== normalized),
+	].slice(0, MAX_RECENT_PAGE_COLORS);
+	writeRecentPageColors(next);
+	return next;
 }
 
 function getOwnedArrayBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -694,7 +764,11 @@ function PageEditorModal({
 		[],
 	);
 	const [autoFixEnabled, setAutoFixEnabled] = useState(!file.autoFixDisabled);
-	const [applyToAll, setApplyToAll] = useState(false);
+	const [selectedPageIndices, setSelectedPageIndices] = useState<number[]>([]);
+	const [pageColorHex, setPageColorHex] = useState(DEFAULT_PAGE_COLOR_HEX);
+	const [recentPageColors, setRecentPageColors] = useState<string[]>(() =>
+		readRecentPageColors(),
+	);
 	const splitPageRenderWidth = 420;
 	const pageRenderWidth = compareView === "split" ? splitPageRenderWidth : 560;
 	const renderedPageWidth =
@@ -702,6 +776,22 @@ function PageEditorModal({
 			? pageRenderWidth
 			: Math.min(window.innerWidth * 0.3, pageRenderWidth);
 	const editorSourceBytes = autoFixEnabled ? fileBytes : originalFileBytes;
+	const selectedPageIndexSet = useMemo(
+		() => new Set(selectedPageIndices),
+		[selectedPageIndices],
+	);
+	const targetPageIndices = useMemo(
+		() => (
+			selectedPageIndices.length > 0
+				? selectedPageIndices
+				: [selectedPageIndex]
+		),
+		[selectedPageIndices, selectedPageIndex],
+	);
+	const colorSwatches = useMemo(
+		() => Array.from(new Set([...PRESET_PAGE_COLORS, ...recentPageColors])),
+		[recentPageColors],
+	);
 
 	const workerRef = useRef<Worker | null>(null);
 	const previewRequestIdRef = useRef(0);
@@ -903,11 +993,11 @@ function PageEditorModal({
 	}, [previewUrl, compareView]);
 
 	const pageFixTypes = useMemo(() => {
-		const perPage = new Map<number, { rotation: boolean; scaling: boolean }>();
+		const perPage = new Map<number, { rotation: boolean; scaling: boolean; color: boolean }>();
 		const ensure = (pageIndex: number) => {
 			let existing = perPage.get(pageIndex);
 			if (!existing) {
-				existing = { rotation: false, scaling: false };
+				existing = { rotation: false, scaling: false, color: false };
 				perPage.set(pageIndex, existing);
 			}
 			return existing;
@@ -930,31 +1020,58 @@ function PageEditorModal({
 				const pageFix = ensure(pageIndex);
 				if (modification.type === "rotate") pageFix.rotation = true;
 				if (modification.type === "fitToA4") pageFix.scaling = true;
+				if (modification.type === "setPageColor") pageFix.color = true;
 			}
 		}
 
 		return perPage;
 	}, [file.autoFixedPageFixTypes, modifications]);
 
+	const togglePageSelection = useCallback((pageIndex: number) => {
+		setSelectedPageIndices((previous) => {
+			if (previous.includes(pageIndex)) {
+				return previous.filter((index) => index !== pageIndex);
+			}
+			return [...previous, pageIndex].sort((a, b) => a - b);
+		});
+	}, []);
+
+	const selectAllPages = useCallback(() => {
+		setSelectedPageIndices(Array.from({ length: file.pageCount }, (_, i) => i));
+	}, [file.pageCount]);
+
+	const clearSelectedPages = useCallback(() => {
+		setSelectedPageIndices([]);
+	}, []);
+
 	const applyRotate = useCallback((angle: number) => {
-		const indicesToProcess = applyToAll
-			? Array.from({ length: file.pageCount }, (_, i) => i)
-			: [selectedPageIndex];
 		setModifications((prev) => [
 			...prev,
-			{ type: "rotate", pageIndices: indicesToProcess, angle },
+			{ type: "rotate", pageIndices: targetPageIndices, angle },
 		]);
-	}, [selectedPageIndex, applyToAll, file.pageCount]);
+	}, [targetPageIndices]);
 
 	const applyModifications = useCallback((modType: "fitToA4") => {
-		const indicesToProcess = applyToAll
-			? Array.from({ length: file.pageCount }, (_, i) => i)
-			: [selectedPageIndex];
 		setModifications((prev) => [
 			...prev,
-			{ type: modType, pageIndices: indicesToProcess },
+			{ type: modType, pageIndices: targetPageIndices },
 		]);
-	}, [selectedPageIndex, applyToAll, file.pageCount]);
+	}, [targetPageIndices]);
+
+	const applyPageColor = useCallback((hex: string) => {
+		const normalized = normalizeHexColor(hex);
+		if (!normalized) return;
+		setPageColorHex(normalized);
+		setRecentPageColors((previous) => addRecentPageColor(previous, normalized));
+		setModifications((prev) => [
+			...prev,
+			{
+				type: "setPageColor",
+				pageIndices: targetPageIndices,
+				color: hexToPageColor(normalized),
+			},
+		]);
+	}, [targetPageIndices]);
 
 	const handleRasterize = useCallback(async () => {
 		setIsSaving(true);
@@ -1147,9 +1264,30 @@ function PageEditorModal({
 
 				<div className="flex-1 overflow-hidden flex bg-slate-100">
 					<div className="w-64 border-r border-slate-200 bg-white overflow-y-auto px-3 py-4">
-						<p className="text-xs font-semibold uppercase tracking-wider text-slate-500 px-2 mb-3">
-							Pages
-						</p>
+						<div className="mb-3 flex items-center justify-between px-2">
+							<p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+								Pages
+							</p>
+							<span className="text-[11px] font-medium text-slate-500">
+								{selectedPageIndices.length} selected
+							</span>
+						</div>
+						<div className="mb-3 grid grid-cols-2 gap-2 px-2">
+							<button
+								type="button"
+								onClick={selectAllPages}
+								className="rounded-md border border-slate-200 px-2 py-1.5 text-xs font-medium text-slate-600 hover:border-indigo-300 hover:text-indigo-700"
+							>
+								Select all
+							</button>
+							<button
+								type="button"
+								onClick={clearSelectedPages}
+								className="rounded-md border border-slate-200 px-2 py-1.5 text-xs font-medium text-slate-600 hover:border-indigo-300 hover:text-indigo-700"
+							>
+								Clear
+							</button>
+						</div>
 						{navigatorPreviewUrl ? (
 							<Document
 								key={navigatorPreviewUrl}
@@ -1163,7 +1301,8 @@ function PageEditorModal({
 							>
 								{Array.from(new Array(file.pageCount), (_el, index) => {
 									const pageFix = pageFixTypes.get(index);
-									const hasFix = Boolean(pageFix?.rotation || pageFix?.scaling);
+									const hasFix = Boolean(pageFix?.rotation || pageFix?.scaling || pageFix?.color);
+									const isPageSelected = selectedPageIndexSet.has(index);
 									const navigatorRotation =
 										compareView === "before"
 											? beforeDisplayRotations[index]
@@ -1177,16 +1316,27 @@ function PageEditorModal({
 												"w-full text-left rounded-lg border p-2 transition-all",
 												selectedPageIndex === index
 													? "border-indigo-400 bg-indigo-50 shadow-sm"
-													: "border-slate-200 bg-white hover:border-indigo-300 hover:bg-slate-50",
+													: isPageSelected
+														? "border-indigo-300 bg-indigo-50/60"
+														: "border-slate-200 bg-white hover:border-indigo-300 hover:bg-slate-50",
 											)}
 										>
 											<div className="mb-2 flex items-center justify-between">
-												<span className="text-xs font-medium text-slate-700">
+												<label
+													className="flex items-center gap-2 text-xs font-medium text-slate-700"
+													onClick={(event) => event.stopPropagation()}
+												>
+													<input
+														type="checkbox"
+														checked={isPageSelected}
+														onChange={() => togglePageSelection(index)}
+														className="h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+													/>
 													Page {index + 1}
-												</span>
+												</label>
 												{hasFix && (
 													<span className="text-[10px] font-semibold text-indigo-700 bg-indigo-100 px-1.5 py-0.5 rounded">
-														Fixed
+														Edited
 													</span>
 												)}
 											</div>
@@ -1349,7 +1499,9 @@ function PageEditorModal({
 						Settings
 					</h3>
 					<p className="text-xs text-slate-500">
-						Page {selectedPageIndex + 1} selected
+						{selectedPageIndices.length > 0
+							? `${selectedPageIndices.length} page${selectedPageIndices.length === 1 ? "" : "s"} selected`
+							: `Page ${selectedPageIndex + 1} active`}
 					</p>
 				</div>
 
@@ -1390,30 +1542,19 @@ function PageEditorModal({
 							Manual Fixes
 						</h4>
 
-						<label className="flex items-center justify-between p-3 bg-slate-50 rounded-lg">
+						<div className="flex items-center justify-between p-3 bg-slate-50 rounded-lg">
 							<div className="flex items-center gap-2">
 								<Layers className="w-4 h-4 text-slate-500" />
-								<span className="text-sm font-medium text-slate-700">Apply to All</span>
+								<span className="text-sm font-medium text-slate-700">Target</span>
 							</div>
-							<button
-								onClick={() => setApplyToAll((previous) => !previous)}
-								className={cn(
-									"relative w-10 h-6 rounded-full transition-colors",
-									applyToAll ? "bg-indigo-600" : "bg-slate-300",
-								)}
-							>
-								<div
-									className={cn(
-										"absolute top-1 w-4 h-4 bg-white rounded-full shadow transition-transform",
-										applyToAll ? "translate-x-5" : "translate-x-1",
-									)}
-								/>
-							</button>
-						</label>
+							<span className="text-xs font-semibold text-slate-600">
+								{selectedPageIndices.length > 0
+									? `${selectedPageIndices.length} selected`
+									: `Page ${selectedPageIndex + 1}`}
+							</span>
+						</div>
 						<p className="text-xs text-slate-500 px-1">
-							{applyToAll
-								? `Applying to all ${file.pageCount} pages`
-								: "Applying to selected page only"}
+							Use the page checkboxes for batch edits; with none selected, edits apply to the active page.
 						</p>
 
 						<div className="space-y-2">
@@ -1445,6 +1586,54 @@ function PageEditorModal({
 								<Maximize className="w-4 h-4" />
 								<span className="text-sm font-medium">Fit to A4</span>
 							</button>
+						</div>
+
+						<div className="space-y-2">
+							<p className="text-xs text-slate-500 font-medium">Page Colour</p>
+							<div className="grid grid-cols-6 gap-2">
+								{colorSwatches.map((color) => (
+									<button
+										key={color}
+										type="button"
+										onClick={() => applyPageColor(color)}
+										className={cn(
+											"h-8 rounded-md border transition-all",
+											pageColorHex === color
+												? "border-indigo-500 ring-2 ring-indigo-500/20"
+												: "border-slate-300 hover:border-indigo-400",
+										)}
+										style={{ backgroundColor: color }}
+										title={`Apply ${color}`}
+										aria-label={`Apply page colour ${color}`}
+									/>
+								))}
+							</div>
+							<div className="flex items-center gap-2">
+								<label className="flex h-10 w-12 cursor-pointer items-center justify-center rounded-lg border border-slate-200 bg-white p-1 hover:border-indigo-300">
+									<input
+										type="color"
+										value={pageColorHex}
+										onChange={(event) => setPageColorHex(event.target.value)}
+										onBlur={(event) => applyPageColor(event.target.value)}
+										className="h-full w-full cursor-pointer border-0 bg-transparent p-0"
+										aria-label="Choose custom page colour"
+									/>
+								</label>
+								<button
+									type="button"
+									onClick={() => applyPageColor(pageColorHex)}
+									className="flex-1 rounded-lg bg-slate-100 px-3 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-200"
+								>
+									Apply custom
+								</button>
+								<button
+									type="button"
+									onClick={() => applyPageColor(DEFAULT_PAGE_COLOR_HEX)}
+									className="rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 transition-colors hover:bg-slate-50"
+								>
+									Reset
+								</button>
+							</div>
 						</div>
 					</div>
 

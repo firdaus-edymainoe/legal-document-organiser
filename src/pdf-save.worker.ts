@@ -7,6 +7,7 @@ import {
 	PDFName,
 	PDFArray,
 	PDFNumber,
+	drawRectangle,
 } from "pdf-lib";
 import {
 	loadPdfForEditing,
@@ -16,7 +17,14 @@ import {
 
 export type PageModification =
 	| { type: "rotate"; pageIndices: number[]; angle: number }
-	| { type: "fitToA4"; pageIndices: number[] };
+	| { type: "fitToA4"; pageIndices: number[] }
+	| { type: "setPageColor"; pageIndices: number[]; color: PageColor };
+
+interface PageColor {
+	red: number;
+	green: number;
+	blue: number;
+}
 
 export interface WorkerRequest {
 	type: "preview" | "save";
@@ -97,6 +105,7 @@ function applyModifications(
 	modifications: PageModification[],
 ) {
 	const pageCount = doc.getPageCount();
+	const pageColors = new Map<number, PageColor>();
 
 	for (const mod of modifications) {
 		const indices = new Set(mod.pageIndices);
@@ -139,7 +148,50 @@ function applyModifications(
 					}
 				}
 			}
+		} else if (mod.type === "setPageColor") {
+			for (let i = 0; i < pageCount; i++) {
+				if (indices.has(i)) {
+					pageColors.set(i, mod.color);
+				}
+			}
 		}
+	}
+
+	for (const [pageIndex, color] of pageColors) {
+		try {
+			const page = doc.getPage(pageIndex);
+			addPageColorUnderlay(page, color);
+		} catch {
+			// Ignore malformed pages.
+		}
+	}
+}
+
+function addPageColorUnderlay(
+	page: ReturnType<PDFDocument["getPage"]>,
+	color: PageColor,
+) {
+	const { width, height } = page.getSize();
+	const backgroundStream = page.doc.context.contentStream(
+		drawRectangle({
+			x: 0,
+			y: 0,
+			width,
+			height,
+			borderWidth: 0,
+			color: rgb(color.red, color.green, color.blue),
+			borderColor: undefined,
+			rotate: degrees(0),
+			xSkew: degrees(0),
+			ySkew: degrees(0),
+		}),
+	);
+	const backgroundStreamRef = page.doc.context.register(backgroundStream);
+	const contents = page.node.normalizedEntries().Contents;
+	if (contents) {
+		contents.insert(0, backgroundStreamRef);
+	} else {
+		page.node.addContentStream(backgroundStreamRef);
 	}
 }
 

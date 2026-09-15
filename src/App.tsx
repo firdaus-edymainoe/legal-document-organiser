@@ -64,6 +64,7 @@ import {
 	normalizePdfForEditing,
 	stripLogicalPageMetadata,
 } from "./lib/pdf-security";
+import { autoFixOntoA4, type Rotation, viewerTextAngle } from "./lib/pdf-normalize";
 import { cn } from "./lib/utils";
 
 interface PageHeaderProps {
@@ -264,9 +265,10 @@ function chooseFinalPageRotationForPortrait(
 
 	const candidates = [0, 180].map((finalRotation) => {
 		const delta = normalizeAngle(finalRotation - currentPageRotation);
-		// pdf.js text item transforms are in page content space and don't include page /Rotate.
-		// So final visible orientation is content angle + final page rotation.
-		const finalTextAngle = normalizeAngle(dominantTextAngle + finalRotation);
+		const finalTextAngle = viewerTextAngle(
+			snapToRightAngle(dominantTextAngle) as Rotation,
+			snapToRightAngle(finalRotation) as Rotation,
+		);
 		const bestAllowedDistance = circularDistance(finalTextAngle, 0);
 		const turnCost = Math.min(delta, 360 - delta);
 		return { finalRotation, bestAllowedDistance, turnCost };
@@ -288,7 +290,10 @@ function getUpsideDownCorrectionFromAngle(
 ): number {
 	if (dominantTextAngle === null) return 0;
 
-	const visibleTextAngle = normalizeAngle(dominantTextAngle + pageRotation);
+	const visibleTextAngle = viewerTextAngle(
+		snapToRightAngle(dominantTextAngle) as Rotation,
+		snapToRightAngle(pageRotation) as Rotation,
+	);
 	const allowedDistance = circularDistance(visibleTextAngle, 0);
 	const upsideDistance = circularDistance(visibleTextAngle, 180);
 	const confidenceMargin = allowedDistance - upsideDistance;
@@ -708,6 +713,85 @@ function getIssuesFromDoc(doc: PDFDocument): PageIssue[] {
 	return issues;
 }
 
+
+async function extrasFromUpsideDownText(pdfBytes: Uint8Array): Promise<Map<number, Rotation>> {
+	const extras = new Map<number, Rotation>();
+	try {
+		const angles = await detectDominantTextAngles(pdfBytes);
+		const doc = await loadPdfForEditing(pdfBytes);
+		doc.getPages().forEach((page, index) => {
+			const rotation = normalizeAngle(page.getRotation().angle);
+			if (getUpsideDownCorrectionFromAngle(angles[index] ?? null, rotation) === 180) {
+				extras.set(index, 180);
+			}
+		});
+	} catch {
+		// Text detection is best-effort; flatten still runs.
+	}
+	return extras;
+}
+
+async function runAutoFixPdf(pdfBytes: Uint8Array): Promise<{
+	bytes: Uint8Array;
+	issues: PageIssue[];
+	pageCount: number;
+	autoFixApplied: boolean;
+	autoFixSummary?: string;
+	autoFixedPageFixTypes: Record<number, ("rotation" | "scaling")[]>;
+}> {
+	const buildRasterizedFallbackResult = async () => {
+		const rasterizedBytes = await rasterizePdfToEditableA4(pdfBytes);
+		const rasterizedDoc = await loadPdfForEditing(rasterizedBytes);
+		const pageCount = rasterizedDoc.getPageCount();
+		const autoFixedPageFixTypes = Object.fromEntries(
+			Array.from({ length: pageCount }, (_, pageIndex) => [
+				pageIndex,
+				["scaling"] as ("rotation" | "scaling")[],
+			]),
+		);
+		return {
+			bytes: rasterizedBytes,
+			issues: getIssuesFromDoc(rasterizedDoc),
+			pageCount,
+			autoFixApplied: true,
+			autoFixSummary: `${pageCount}/${pageCount} pages rasterized and normalized to A4 to bypass PDF protection. ${IMAGE_ONLY_NOTICE}`,
+			autoFixedPageFixTypes,
+		};
+	};
+
+	try {
+		const extras = await extrasFromUpsideDownText(pdfBytes);
+		const result = await autoFixOntoA4(pdfBytes, extras);
+		const finalDoc = await loadPdfForEditing(result.bytes);
+		return {
+			bytes: result.bytes,
+			issues: getIssuesFromDoc(finalDoc),
+			pageCount: result.pageCount,
+			autoFixApplied: result.autoFixApplied,
+			autoFixSummary: result.autoFixApplied
+				? `${result.changedPages}/${result.pageCount} pages normalized to A4; ${result.rotatedPages} page(s) auto-rotated.`
+				: undefined,
+			autoFixedPageFixTypes: result.autoFixedPageFixTypes,
+		};
+	} catch (error) {
+		console.error("Error auto-fixing PDF:", error);
+		try {
+			return await buildRasterizedFallbackResult();
+		} catch (rasterError) {
+			console.error("Raster fallback failed:", rasterError);
+			const srcDocFallback = await loadPdfForEditing(pdfBytes);
+			return {
+				bytes: pdfBytes,
+				issues: getIssuesFromDoc(srcDocFallback),
+				pageCount: srcDocFallback.getPageCount(),
+				autoFixApplied: false,
+				autoFixSummary: undefined,
+				autoFixedPageFixTypes: {},
+			};
+		}
+	}
+}
+
 function getBeforePreviewDisplayRotation(
 	width: number,
 	height: number,
@@ -721,7 +805,10 @@ function getBeforePreviewDisplayRotation(
 	const isPortraitPage = effectiveHeight >= effectiveWidth;
 	if (!isPortraitPage) return 0;
 
-	const visibleTextAngle = normalizeAngle(dominantTextAngle + pageRotation);
+	const visibleTextAngle = viewerTextAngle(
+		snapToRightAngle(dominantTextAngle) as Rotation,
+		snapToRightAngle(pageRotation) as Rotation,
+	);
 	if (visibleTextAngle === 90) return 270;
 	if (visibleTextAngle === 270) return 90;
 	return 0;
@@ -1973,191 +2060,7 @@ function BundleOfAuthoritiesPage() {
 		};
 	}, [previewUrl]);
 
-	const autoFixPdf = async (
-		pdfBytes: Uint8Array,
-	): Promise<{
-		bytes: Uint8Array;
-		issues: PageIssue[];
-		pageCount: number;
-		autoFixApplied: boolean;
-		autoFixSummary?: string;
-		autoFixedPageFixTypes: Record<number, ("rotation" | "scaling")[]>;
-	}> => {
-		const buildRasterizedFallbackResult = async () => {
-			const rasterizedBytes = await rasterizePdfToEditableA4(pdfBytes);
-			const rasterizedDoc = await loadPdfForEditing(rasterizedBytes);
-			const pageCount = rasterizedDoc.getPageCount();
-			const autoFixedPageFixTypes = Object.fromEntries(
-				Array.from({ length: pageCount }, (_, pageIndex) => [
-					pageIndex,
-					["scaling"] as ("rotation" | "scaling")[],
-				]),
-			);
-			return {
-				bytes: rasterizedBytes,
-				issues: getIssuesFromDoc(rasterizedDoc),
-				pageCount,
-				autoFixApplied: true,
-				autoFixSummary: `${pageCount}/${pageCount} pages rasterized and normalized to A4 to bypass PDF protection. ${IMAGE_ONLY_NOTICE}`,
-				autoFixedPageFixTypes,
-			};
-		};
-
-		try {
-			const srcDoc = await loadPdfForEditing(pdfBytes);
-			const [A4_WIDTH, A4_HEIGHT] = PageSizes.A4;
-			const pageCount = srcDoc.getPageCount();
-			let malformedPageEncountered = false;
-			let textAngles: (number | null)[] = [];
-			try {
-				textAngles = await detectDominantTextAngles(pdfBytes);
-			} catch {
-				textAngles = Array.from({ length: pageCount }, () => null);
-			}
-			const autoFixedPageFixes = new Map<
-				number,
-				{ rotation: boolean; scaling: boolean }
-			>();
-			const markFix = (
-				pageIndex: number,
-				type: "rotation" | "scaling",
-			) => {
-				const existing = autoFixedPageFixes.get(pageIndex) ?? {
-					rotation: false,
-					scaling: false,
-				};
-				existing[type] = true;
-				autoFixedPageFixes.set(pageIndex, existing);
-			};
-			let rotatedPages = 0;
-
-			for (let i = 0; i < pageCount; i++) {
-				try {
-					const page = srcDoc.getPage(i);
-					const { width, height } = page.getSize();
-					const currentRotation = normalizeAngle(page.getRotation().angle);
-					const detectedTextAngle = textAngles[i] ?? null;
-					const nextRotation = chooseFinalPageRotationForPortrait(
-						currentRotation,
-						detectedTextAngle,
-					);
-					page.setRotation(degrees(nextRotation));
-					if (nextRotation !== currentRotation) rotatedPages++;
-
-					const targetW = A4_WIDTH;
-					const targetH = A4_HEIGHT;
-					const scale = Math.min(targetW / width, targetH / height);
-					const scaledWidth = width * scale;
-					const scaledHeight = height * scale;
-					const dx = (targetW - scaledWidth) / 2;
-					const dy = (targetH - scaledHeight) / 2;
-
-					page.setSize(targetW, targetH);
-					page.scaleContent(scale, scale);
-					page.translateContent(dx, dy);
-					scaleAndTranslatePageAnnotations(page, scale, dx, dy);
-
-					if (
-						nextRotation !== currentRotation ||
-						Math.abs(width - targetW) > 0.5 ||
-						Math.abs(height - targetH) > 0.5
-					) {
-						if (nextRotation !== currentRotation) {
-							markFix(i, "rotation");
-						}
-						if (
-							Math.abs(width - targetW) > 0.5 ||
-							Math.abs(height - targetH) > 0.5
-						) {
-							markFix(i, "scaling");
-						}
-					}
-				} catch {
-					malformedPageEncountered = true;
-				}
-			}
-
-			const firstPassBytes = await srcDoc.save({
-				useObjectStreams: true,
-				objectsPerTick: 100,
-			});
-
-			const finalAngles = await detectDominantTextAngles(firstPassBytes);
-			const firstPassDoc = await loadPdfForEditing(firstPassBytes);
-			const firstPassRotations = firstPassDoc
-				.getPages()
-				.map((page) => normalizeAngle(page.getRotation().angle));
-			const upsideDownPages: number[] = [];
-			for (let i = 0; i < finalAngles.length; i++) {
-				if (
-					getUpsideDownCorrectionFromAngle(
-						finalAngles[i],
-						firstPassRotations[i] ?? 0,
-					) === 180
-				) {
-					upsideDownPages.push(i);
-				}
-			}
-
-			let finalBytes = firstPassBytes;
-			if (upsideDownPages.length > 0) {
-				const correctedDoc = await loadPdfForEditing(firstPassBytes);
-				for (const pageIndex of upsideDownPages) {
-					const page = correctedDoc.getPage(pageIndex);
-					const rotation = normalizeAngle(page.getRotation().angle);
-					page.setRotation(degrees(rotation + 180));
-					markFix(pageIndex, "rotation");
-				}
-				finalBytes = await correctedDoc.save({
-					useObjectStreams: true,
-					objectsPerTick: 100,
-				});
-				rotatedPages += upsideDownPages.length;
-			}
-
-			const finalDocForIssues = await loadPdfForEditing(finalBytes);
-			const remainingIssues = getIssuesFromDoc(finalDocForIssues);
-			const changedPages = autoFixedPageFixes.size;
-			const autoFixApplied = changedPages > 0;
-			const autoFixSummary = autoFixApplied
-				? `${changedPages}/${pageCount} pages normalized to A4; ${rotatedPages} page(s) auto-rotated using text orientation detection.`
-				: undefined;
-			const autoFixedPageFixTypes = Object.fromEntries(
-				Array.from(autoFixedPageFixes.entries()).map(([pageIndex, fix]) => [
-					pageIndex,
-					[
-						...(fix.rotation ? (["rotation"] as const) : []),
-						...(fix.scaling ? (["scaling"] as const) : []),
-					],
-				]),
-			);
-
-			return {
-				bytes: finalBytes,
-				issues: remainingIssues,
-				pageCount,
-				autoFixApplied,
-				autoFixSummary,
-				autoFixedPageFixTypes,
-			};
-		} catch (error) {
-			console.error("Error auto-fixing PDF:", error);
-			try {
-				return await buildRasterizedFallbackResult();
-			} catch (rasterError) {
-				console.error("Raster fallback failed:", rasterError);
-				const srcDocFallback = await loadPdfForEditing(pdfBytes);
-				return {
-					bytes: pdfBytes,
-					issues: getIssuesFromDoc(srcDocFallback),
-					pageCount: srcDocFallback.getPageCount(),
-					autoFixApplied: false,
-					autoFixSummary: undefined,
-					autoFixedPageFixTypes: {},
-				};
-			}
-		}
-	};
+	const autoFixPdf = (pdfBytes: Uint8Array) => runAutoFixPdf(pdfBytes);
 
 	const processCoverFile = async (file: File) => {
 		if (file.type === "application/pdf") {
@@ -3117,191 +3020,7 @@ function PdfPageFixerPage() {
 		};
 	}, [previewUrl]);
 
-	const autoFixPdf = async (
-		pdfBytes: Uint8Array,
-	): Promise<{
-		bytes: Uint8Array;
-		issues: PageIssue[];
-		pageCount: number;
-		autoFixApplied: boolean;
-		autoFixSummary?: string;
-		autoFixedPageFixTypes: Record<number, ("rotation" | "scaling")[]>;
-	}> => {
-		const buildRasterizedFallbackResult = async () => {
-			const rasterizedBytes = await rasterizePdfToEditableA4(pdfBytes);
-			const rasterizedDoc = await loadPdfForEditing(rasterizedBytes);
-			const pageCount = rasterizedDoc.getPageCount();
-			const autoFixedPageFixTypes = Object.fromEntries(
-				Array.from({ length: pageCount }, (_, pageIndex) => [
-					pageIndex,
-					["scaling"] as ("rotation" | "scaling")[],
-				]),
-			);
-			return {
-				bytes: rasterizedBytes,
-				issues: getIssuesFromDoc(rasterizedDoc),
-				pageCount,
-				autoFixApplied: true,
-				autoFixSummary: `${pageCount}/${pageCount} pages rasterized and normalized to A4 to bypass PDF protection. ${IMAGE_ONLY_NOTICE}`,
-				autoFixedPageFixTypes,
-			};
-		};
-
-		try {
-			const srcDoc = await loadPdfForEditing(pdfBytes);
-			const [A4_WIDTH, A4_HEIGHT] = PageSizes.A4;
-			const pageCount = srcDoc.getPageCount();
-			let malformedPageEncountered = false;
-			let textAngles: (number | null)[] = [];
-			try {
-				textAngles = await detectDominantTextAngles(pdfBytes);
-			} catch {
-				textAngles = Array.from({ length: pageCount }, () => null);
-			}
-			const autoFixedPageFixes = new Map<
-				number,
-				{ rotation: boolean; scaling: boolean }
-			>();
-			const markFix = (
-				pageIndex: number,
-				type: "rotation" | "scaling",
-			) => {
-				const existing = autoFixedPageFixes.get(pageIndex) ?? {
-					rotation: false,
-					scaling: false,
-				};
-				existing[type] = true;
-				autoFixedPageFixes.set(pageIndex, existing);
-			};
-			let rotatedPages = 0;
-
-			for (let i = 0; i < pageCount; i++) {
-				try {
-					const page = srcDoc.getPage(i);
-					const { width, height } = page.getSize();
-					const currentRotation = normalizeAngle(page.getRotation().angle);
-					const detectedTextAngle = textAngles[i] ?? null;
-					const nextRotation = chooseFinalPageRotationForPortrait(
-						currentRotation,
-						detectedTextAngle,
-					);
-					page.setRotation(degrees(nextRotation));
-					if (nextRotation !== currentRotation) rotatedPages++;
-
-					const targetW = A4_WIDTH;
-					const targetH = A4_HEIGHT;
-					const scale = Math.min(targetW / width, targetH / height);
-					const scaledWidth = width * scale;
-					const scaledHeight = height * scale;
-					const dx = (targetW - scaledWidth) / 2;
-					const dy = (targetH - scaledHeight) / 2;
-
-					page.setSize(targetW, targetH);
-					page.scaleContent(scale, scale);
-					page.translateContent(dx, dy);
-					scaleAndTranslatePageAnnotations(page, scale, dx, dy);
-
-					if (
-						nextRotation !== currentRotation ||
-						Math.abs(width - targetW) > 0.5 ||
-						Math.abs(height - targetH) > 0.5
-					) {
-						if (nextRotation !== currentRotation) {
-							markFix(i, "rotation");
-						}
-						if (
-							Math.abs(width - targetW) > 0.5 ||
-							Math.abs(height - targetH) > 0.5
-						) {
-							markFix(i, "scaling");
-						}
-					}
-				} catch {
-					malformedPageEncountered = true;
-				}
-			}
-
-			const firstPassBytes = await srcDoc.save({
-				useObjectStreams: true,
-				objectsPerTick: 100,
-			});
-
-			const finalAngles = await detectDominantTextAngles(firstPassBytes);
-			const firstPassDoc = await loadPdfForEditing(firstPassBytes);
-			const firstPassRotations = firstPassDoc
-				.getPages()
-				.map((page) => normalizeAngle(page.getRotation().angle));
-			const upsideDownPages: number[] = [];
-			for (let i = 0; i < finalAngles.length; i++) {
-				if (
-					getUpsideDownCorrectionFromAngle(
-						finalAngles[i],
-						firstPassRotations[i] ?? 0,
-					) === 180
-				) {
-					upsideDownPages.push(i);
-				}
-			}
-
-			let finalBytes = firstPassBytes;
-			if (upsideDownPages.length > 0) {
-				const correctedDoc = await loadPdfForEditing(firstPassBytes);
-				for (const pageIndex of upsideDownPages) {
-					const page = correctedDoc.getPage(pageIndex);
-					const rotation = normalizeAngle(page.getRotation().angle);
-					page.setRotation(degrees(rotation + 180));
-					markFix(pageIndex, "rotation");
-				}
-				finalBytes = await correctedDoc.save({
-					useObjectStreams: true,
-					objectsPerTick: 100,
-				});
-				rotatedPages += upsideDownPages.length;
-			}
-
-			const finalDocForIssues = await loadPdfForEditing(finalBytes);
-			const remainingIssues = getIssuesFromDoc(finalDocForIssues);
-			const changedPages = autoFixedPageFixes.size;
-			const autoFixApplied = changedPages > 0;
-			const autoFixSummary = autoFixApplied
-				? `${changedPages}/${pageCount} pages normalized to A4; ${rotatedPages} page(s) auto-rotated using text orientation detection.`
-				: undefined;
-			const autoFixedPageFixTypes = Object.fromEntries(
-				Array.from(autoFixedPageFixes.entries()).map(([pageIndex, fix]) => [
-					pageIndex,
-					[
-						...(fix.rotation ? (["rotation"] as const) : []),
-						...(fix.scaling ? (["scaling"] as const) : []),
-					],
-				]),
-			);
-
-			return {
-				bytes: finalBytes,
-				issues: remainingIssues,
-				pageCount,
-				autoFixApplied,
-				autoFixSummary,
-				autoFixedPageFixTypes,
-			};
-		} catch (error) {
-			console.error("Error auto-fixing PDF:", error);
-			try {
-				return await buildRasterizedFallbackResult();
-			} catch (rasterError) {
-				console.error("Raster fallback failed:", rasterError);
-				const srcDocFallback = await loadPdfForEditing(pdfBytes);
-				return {
-					bytes: pdfBytes,
-					issues: getIssuesFromDoc(srcDocFallback),
-					pageCount: srcDocFallback.getPageCount(),
-					autoFixApplied: false,
-					autoFixSummary: undefined,
-					autoFixedPageFixTypes: {},
-				};
-			}
-		}
-	};
+	const autoFixPdf = (pdfBytes: Uint8Array) => runAutoFixPdf(pdfBytes);
 
 	const processFiles = async (files: File[]) => {
 		const pdfFiles = files.filter((file) => file.type === "application/pdf");

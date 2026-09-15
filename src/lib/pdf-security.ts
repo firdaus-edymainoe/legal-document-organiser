@@ -11,7 +11,7 @@ const LOAD_OPTIONS = {
 	ignoreEncryption: true,
 } as const;
 
-const SAVE_OPTIONS = {
+export const SAVE_OPTIONS = {
 	useObjectStreams: true,
 	objectsPerTick: 100,
 } as const;

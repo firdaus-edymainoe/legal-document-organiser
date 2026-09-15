@@ -14,6 +14,7 @@ import {
 	normalizePdfForEditing,
 	stripLogicalPageMetadata,
 } from "./lib/pdf-security";
+import { rebuildDocFittingPages } from "./lib/pdf-normalize";
 
 export type PageModification =
 	| { type: "rotate"; pageIndices: number[]; angle: number }
@@ -100,12 +101,13 @@ function getIssuesFromDoc(doc: PDFDocument) {
 	return issues;
 }
 
-function applyModifications(
+async function applyModifications(
 	doc: PDFDocument,
 	modifications: PageModification[],
-) {
+): Promise<PDFDocument> {
 	const pageCount = doc.getPageCount();
 	const pageColors = new Map<number, PageColor>();
+	const fitIndices = new Set<number>();
 
 	for (const mod of modifications) {
 		const indices = new Set(mod.pageIndices);
@@ -123,31 +125,7 @@ function applyModifications(
 				}
 			}
 		} else if (mod.type === "fitToA4") {
-			const [A4_WIDTH, A4_HEIGHT] = PageSizes.A4;
-			for (let i = 0; i < pageCount; i++) {
-				if (indices.has(i)) {
-					try {
-						const page = doc.getPage(i);
-						const { width, height } = page.getSize();
-
-						const scale = Math.min(
-							A4_WIDTH / width,
-							A4_HEIGHT / height,
-						);
-						const scaledWidth = width * scale;
-						const scaledHeight = height * scale;
-						const dx = (A4_WIDTH - scaledWidth) / 2;
-						const dy = (A4_HEIGHT - scaledHeight) / 2;
-
-						page.setSize(A4_WIDTH, A4_HEIGHT);
-						page.scaleContent(scale, scale);
-						page.translateContent(dx, dy);
-						scaleAndTranslatePageAnnotations(page, scale, dx, dy);
-					} catch {
-						// Ignore malformed pages.
-					}
-				}
-			}
+			for (const index of indices) fitIndices.add(index);
 		} else if (mod.type === "setPageColor") {
 			for (let i = 0; i < pageCount; i++) {
 				if (indices.has(i)) {
@@ -157,14 +135,21 @@ function applyModifications(
 		}
 	}
 
+	let next = doc;
+	if (fitIndices.size > 0) {
+		next = await rebuildDocFittingPages(next, fitIndices);
+	}
+
 	for (const [pageIndex, color] of pageColors) {
 		try {
-			const page = doc.getPage(pageIndex);
+			const page = next.getPage(pageIndex);
 			addPageColorUnderlay(page, color);
 		} catch {
 			// Ignore malformed pages.
 		}
 	}
+
+	return next;
 }
 
 function addPageColorUnderlay(
@@ -305,8 +290,10 @@ async function handlePreview(
 	const sourceDoc = await getOrParseDoc(bytes);
 
 	// Work on a lightweight copy so modifications don't accumulate on the cached doc
-	const workDoc = await loadPdfForEditing(await sourceDoc.save());
-	applyModifications(workDoc, modifications);
+	const workDoc = await applyModifications(
+		await loadPdfForEditing(await sourceDoc.save()),
+		modifications,
+	);
 
 	if (fullDocumentPreview) {
 		return workDoc.save();
@@ -327,10 +314,8 @@ async function handleSave(
 	addPageNumbers: boolean,
 ): Promise<{ bytes: Uint8Array; issues: ReturnType<typeof getIssuesFromDoc> }> {
 	const { bytes: editableBytes } = await normalizePdfForEditing(bytes);
-	const doc = await loadPdfForEditing(editableBytes);
-
-	// Apply all modifications directly to the existing pages — no copies needed
-	applyModifications(doc, modifications);
+	const loaded = await loadPdfForEditing(editableBytes);
+	const doc = await applyModifications(loaded, modifications);
 
 	// Add page numbers if requested
 	if (addPageNumbers) {
@@ -349,6 +334,11 @@ async function handleSave(
 }
 
 // ── Message handler ──
+
+function packed(bytes: Uint8Array): { bytes: Uint8Array; buffer: ArrayBuffer } {
+	const copy = bytes.slice();
+	return { bytes: copy, buffer: copy.buffer as ArrayBuffer };
+}
 
 self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 	const { type, modifications } = e.data;
@@ -382,19 +372,20 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 				pageIndex,
 				fullDocumentPreview,
 			);
+			const packedPreview = packed(previewBytes);
 			self.postMessage(
-				{ type: "preview", ok: true, bytes: previewBytes, requestId },
-				{ transfer: [previewBytes.buffer as ArrayBuffer] },
+				{ type: "preview", ok: true, bytes: packedPreview.bytes, requestId },
+				{ transfer: [packedPreview.buffer] },
 			);
 		} else {
 			// Release cached doc before heavy save to free memory
 			cachedDoc = null;
 			cachedBytes = null;
 			const result = await handleSave(bytes, modifications, e.data.addPageNumbers ?? false);
-			// Transfer buffer to avoid blocking main thread during structured clone
+			const packedSave = packed(result.bytes);
 			self.postMessage(
-				{ type: "save", ok: true, bytes: result.bytes, issues: result.issues },
-				{ transfer: [result.bytes.buffer as ArrayBuffer] },
+				{ type: "save", ok: true, bytes: packedSave.bytes, issues: result.issues },
+				{ transfer: [packedSave.buffer] },
 			);
 		}
 	} catch (err) {
